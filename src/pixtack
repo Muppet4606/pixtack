@@ -1,0 +1,2790 @@
+#!/usr/bin/env python3
+# Pixtack: a lightweight screenshot, annotation and screen recording tool for Linux.
+# SPDX-License-Identifier: MIT
+
+import argparse
+import copy
+import io
+import json
+import math
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import uuid
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+import cairo  # noqa: E402
+
+APP_NAME = "Pixtack"
+VERSION = "0.4.0"
+DEVNULL = subprocess.DEVNULL
+
+
+# --------------------------------------------------------------------------- helpers
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def session_is_wayland():
+    return (os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+            or bool(os.environ.get("WAYLAND_DISPLAY")))
+
+
+def user_dir(kind, sub, fallback):
+    base = GLib.get_user_special_dir(kind) or os.path.expanduser(fallback)
+    path = os.path.join(base, sub)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def shots_dir():
+    return user_dir(GLib.UserDirectory.DIRECTORY_PICTURES, "Screenshots", "~/Pictures")
+
+
+def videos_dir():
+    return user_dir(GLib.UserDirectory.DIRECTORY_VIDEOS, "Pixtack", "~/Videos")
+
+
+def stamp():
+    return time.strftime("%Y-%m-%d_%H-%M-%S")
+
+
+LOGFILE = os.path.join(GLib.get_user_cache_dir(), "pixtack", "pixtack.log")
+PIDFILE = os.path.join(GLib.get_user_runtime_dir(), "pixtack-recorder.pid")
+CONFIG = os.path.join(GLib.get_user_config_dir(), "pixtack", "settings.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "w") as fh:
+            json.dump(cfg, fh)
+    except OSError:
+        pass
+
+
+def notify(summary, body=""):
+    if have("notify-send"):
+        subprocess.Popen(["notify-send", "-a", APP_NAME, "-i", "pixtack", summary, body],
+                         stdout=DEVNULL, stderr=DEVNULL)
+
+
+def log(msg):
+    """Timestamped line on stderr, which goes to the log file when launched without a terminal."""
+    try:
+        sys.stderr.write("%s [%d] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), msg))
+        sys.stderr.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def setup_logging():
+    """Record every launch, and send output to a log when there is no terminal (e.g. a shortcut)."""
+    try:
+        os.makedirs(os.path.dirname(LOGFILE), exist_ok=True)
+        if os.path.exists(LOGFILE) and os.path.getsize(LOGFILE) > 512 * 1024:
+            os.replace(LOGFILE, LOGFILE + ".old")
+        interactive = sys.stderr is not None and sys.stderr.isatty()
+        if not interactive:
+            fd = os.open(LOGFILE, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            os.dup2(fd, 2)
+            os.close(fd)
+            sys.stderr = os.fdopen(2, "w", buffering=1)
+        else:
+            with open(LOGFILE, "a") as fh:
+                fh.write("%s [%d] started %s (from a terminal)\n" % (
+                    time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), " ".join(sys.argv[1:]) or "launcher"))
+    except OSError:
+        interactive = True
+    if not interactive:
+        log("started %s session=%s desktop=%s" % (
+            " ".join(sys.argv[1:]) or "launcher", os.environ.get("XDG_SESSION_TYPE", "?"),
+            os.environ.get("XDG_CURRENT_DESKTOP", "?")))
+
+    def hook(etype, value, tb):
+        traceback.print_exception(etype, value, tb)
+        notify("Pixtack hit an error", "%s: %s\nDetails are in %s" % (etype.__name__, value, LOGFILE))
+
+    sys.excepthook = hook
+
+
+def error_dialog(msg, parent=None):
+    log("error: " + msg.replace("\n", " "))
+    if not (sys.stderr and sys.stderr.isatty()):
+        notify("Pixtack", msg)
+    dlg = Gtk.MessageDialog(transient_for=parent, modal=True,
+                            message_type=Gtk.MessageType.ERROR,
+                            buttons=Gtk.ButtonsType.CLOSE, text=APP_NAME)
+    dlg.format_secondary_text(msg)
+    dlg.run()
+    dlg.destroy()
+
+
+def confirm_dialog(parent, text, secondary, ok_label):
+    dlg = Gtk.MessageDialog(transient_for=parent, modal=True,
+                            message_type=Gtk.MessageType.QUESTION,
+                            buttons=Gtk.ButtonsType.NONE, text=text)
+    dlg.format_secondary_text(secondary)
+    dlg.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+    btn = dlg.add_button(ok_label, Gtk.ResponseType.OK)
+    btn.get_style_context().add_class("destructive-action")
+    resp = dlg.run()
+    dlg.destroy()
+    return resp == Gtk.ResponseType.OK
+
+
+def clipboard_set_bytes(data, mime):
+    """Copy using wl-copy or xclip. Both keep serving the data after Pixtack exits."""
+    cmds = []
+    if session_is_wayland() and have("wl-copy"):
+        cmds.append(["wl-copy", "--type", mime])
+    if os.environ.get("DISPLAY") and have("xclip"):
+        cmds.append(["xclip", "-selection", "clipboard", "-t", mime, "-i"])
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, input=data, stdout=DEVNULL, stderr=DEVNULL, timeout=5, check=True)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
+def pixbuf_to_surface(pb):
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, pb.get_width(), pb.get_height())
+    cr = cairo.Context(surf)
+    Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+    cr.paint()
+    return surf
+
+
+def surface_copy(src):
+    dst = cairo.ImageSurface(cairo.FORMAT_ARGB32, src.get_width(), src.get_height())
+    cr = cairo.Context(dst)
+    cr.set_source_surface(src, 0, 0)
+    cr.paint()
+    return dst
+
+
+def norm_rect(p1, p2):
+    x, y = min(p1[0], p2[0]), min(p1[1], p2[1])
+    return x, y, abs(p2[0] - p1[0]), abs(p2[1] - p1[1])
+
+
+def paint_blurred(cr, src, x, y, w, h, factor):
+    """Paint a heavily blurred copy of src's (x, y, w, h) region onto cr."""
+    sw_, sh_ = src.get_width(), src.get_height()
+    x0, y0 = max(0, int(x)), max(0, int(y))
+    x1, y1 = min(sw_, int(math.ceil(x + w))), min(sh_, int(math.ceil(y + h)))
+    w, h = x1 - x0, y1 - y0
+    if w < 2 or h < 2:
+        return
+    factor = max(2, int(factor))
+    sw, sh = max(1, w // factor), max(1, h // factor)
+    small = cairo.ImageSurface(cairo.FORMAT_ARGB32, sw, sh)
+    c = cairo.Context(small)
+    c.scale(sw / w, sh / h)
+    c.set_source_surface(src, -x0, -y0)
+    c.get_source().set_filter(cairo.FILTER_GOOD)
+    c.paint()
+    cr.save()
+    cr.rectangle(x0, y0, w, h)
+    cr.clip()
+    cr.translate(x0, y0)
+    cr.scale(w / sw, h / sh)
+    cr.set_source_surface(small, 0, 0)
+    pat = cr.get_source()
+    pat.set_filter(cairo.FILTER_BILINEAR)
+    pat.set_extend(cairo.EXTEND_PAD)
+    cr.paint()
+    cr.restore()
+
+
+def desktop_bounds():
+    disp = Gdk.Display.get_default()
+    geos = [disp.get_monitor(i).get_geometry() for i in range(disp.get_n_monitors())]
+    x0 = min(g.x for g in geos)
+    y0 = min(g.y for g in geos)
+    x1 = max(g.x + g.width for g in geos)
+    y1 = max(g.y + g.height for g in geos)
+    return x0, y0, x1 - x0, y1 - y0
+
+
+# --------------------------------------------------------------------------- xdg-desktop-portal
+
+class Portal:
+    BUS = "org.freedesktop.portal.Desktop"
+    PATH = "/org/freedesktop/portal/desktop"
+
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.sender = self.bus.get_unique_name()[1:].replace(".", "_")
+
+    @staticmethod
+    def token():
+        return "pixtack_" + uuid.uuid4().hex[:12]
+
+    def request(self, iface, method, build_args, timeout=300):
+        """Call a portal method that answers via a Request.Response signal."""
+        tok = self.token()
+        handle = "/org/freedesktop/portal/desktop/request/%s/%s" % (self.sender, tok)
+        loop = GLib.MainLoop()
+        out = {"code": 2, "res": {}, "timed_out": False}
+
+        def on_response(_conn, _sender, _path, _iface, _sig, params, *_):
+            out["code"], out["res"] = params.unpack()
+            loop.quit()
+
+        def on_timeout():
+            out["timed_out"] = True
+            loop.quit()
+            return False
+
+        sub = self.bus.signal_subscribe(self.BUS, "org.freedesktop.portal.Request", "Response",
+                                        handle, None, Gio.DBusSignalFlags.NONE, on_response)
+        try:
+            self.bus.call_sync(self.BUS, self.PATH, iface, method, build_args(tok),
+                               None, Gio.DBusCallFlags.NONE, -1, None)
+            tid = GLib.timeout_add_seconds(timeout, on_timeout)
+            loop.run()
+            if not out["timed_out"]:
+                GLib.source_remove(tid)
+        finally:
+            self.bus.signal_unsubscribe(sub)
+        return out["code"], out["res"]
+
+    def get_property(self, iface, name):
+        try:
+            v = self.bus.call_sync(self.BUS, self.PATH, "org.freedesktop.DBus.Properties", "Get",
+                                   GLib.Variant("(ss)", (iface, name)), GLib.VariantType("(v)"),
+                                   Gio.DBusCallFlags.NONE, -1, None)
+            return v.unpack()[0]
+        except GLib.Error:
+            return None
+
+
+def portal_screenshot(interactive=False):
+    try:
+        portal = Portal()
+        code, res = portal.request(
+            "org.freedesktop.portal.Screenshot", "Screenshot",
+            lambda t: GLib.Variant("(sa{sv})", ("", {
+                "handle_token": GLib.Variant("s", t),
+                "interactive": GLib.Variant("b", interactive)})))
+    except GLib.Error:
+        return None
+    if code != 0 or not res.get("uri"):
+        return None
+    path = Gio.File.new_for_uri(res["uri"]).get_path()
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file(path)
+    except GLib.Error:
+        return None
+    # The portal writes its own file; remove it only if it was created just now.
+    try:
+        if time.time() - os.path.getmtime(path) < 120:
+            os.remove(path)
+    except OSError:
+        pass
+    return pb
+
+
+def capture_desktop():
+    """Capture every monitor. Returns (pixbuf, error_message)."""
+    if session_is_wayland():
+        pb = portal_screenshot(False)
+        if pb is not None:
+            return pb, None
+        for cmd in (["grim"], ["gnome-screenshot", "-f"]):
+            if not have(cmd[0]):
+                continue
+            fd, path = tempfile.mkstemp(prefix="pixtack-", suffix=".png")
+            os.close(fd)
+            try:
+                subprocess.run(cmd + [path], timeout=15, check=True, stdout=DEVNULL, stderr=DEVNULL)
+                return GdkPixbuf.Pixbuf.new_from_file(path), None
+            except (OSError, subprocess.SubprocessError, GLib.Error):
+                pass
+            finally:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        return None, ("Could not capture the screen. On Wayland, Pixtack needs "
+                      "xdg-desktop-portal (default on Ubuntu) or grim.")
+    root = Gdk.get_default_root_window()
+    pb = Gdk.pixbuf_get_from_window(root, 0, 0, root.get_width(), root.get_height())
+    if pb is None:
+        return None, "Could not read the X11 root window."
+    return pb, None
+
+
+def capture_window():
+    if session_is_wayland():
+        # GNOME/KDE show their own picker where a window can be chosen.
+        return portal_screenshot(True), None
+    pb, err = capture_desktop()
+    if pb is None:
+        return None, err
+    win = Gdk.Screen.get_default().get_active_window()
+    if win is None:
+        return pb, None
+    r = win.get_frame_extents()
+    bx, by, bw, bh = desktop_bounds()
+    sx, sy = pb.get_width() / bw, pb.get_height() / bh
+    x0 = max(0, int((r.x - bx) * sx))
+    y0 = max(0, int((r.y - by) * sy))
+    x1 = min(pb.get_width(), int((r.x - bx + r.width) * sx))
+    y1 = min(pb.get_height(), int((r.y - by + r.height) * sy))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return pb, None
+    return pb.new_subpixbuf(x0, y0, x1 - x0, y1 - y0).copy(), None
+
+
+# --------------------------------------------------------------------------- region selector
+
+class RegionSelector(Gtk.Window):
+    """Fullscreen overlay showing a frozen screenshot; drag to pick a region."""
+
+    def __init__(self, pixbuf, hint, on_done):
+        super().__init__(title=APP_NAME + " selection")
+        self.src = pixbuf_to_surface(pixbuf)
+        self.img_w, self.img_h = pixbuf.get_width(), pixbuf.get_height()
+        self.on_done, self.hint = on_done, hint
+        self.p0 = self.p1 = None
+        self.finished = False
+        bx, by, bw, bh = desktop_bounds()
+        self.origin = (bx, by)
+        self.rx, self.ry = self.img_w / bw, self.img_h / bh
+
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        area = Gtk.DrawingArea()
+        area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK)
+        area.connect("draw", self.on_draw)
+        area.connect("button-press-event", self.on_press)
+        area.connect("motion-notify-event", self.on_motion)
+        area.connect("button-release-event", self.on_release)
+        self.area = area
+        self.add(area)
+        self.connect("key-press-event", self.on_key)
+        self.connect("realize", self.on_realize)
+        self.fullscreen()
+        self.show_all()
+        self.present()
+
+    def on_realize(self, *_):
+        self.get_window().set_cursor(Gdk.Cursor.new_from_name(self.get_display(), "crosshair"))
+
+    def monitor_geo(self):
+        disp = self.get_display()
+        gw = self.get_window()
+        mon = disp.get_monitor_at_window(gw) if gw else None
+        mon = mon or disp.get_primary_monitor() or disp.get_monitor(0)
+        return mon.get_geometry()
+
+    def to_img(self, x, y, g):
+        return ((g.x - self.origin[0] + x) * self.rx, (g.y - self.origin[1] + y) * self.ry)
+
+    def sel_rect(self):
+        if self.p0 is None:
+            return None
+        return norm_rect(self.p0, self.p1)
+
+    def on_draw(self, widget, cr):
+        g = self.monitor_geo()
+        cr.save()
+        cr.scale(1 / self.rx, 1 / self.ry)
+        cr.set_source_surface(self.src, -(g.x - self.origin[0]) * self.rx,
+                              -(g.y - self.origin[1]) * self.ry)
+        cr.get_source().set_filter(cairo.FILTER_GOOD)
+        cr.paint()
+        cr.restore()
+        W, H = widget.get_allocated_width(), widget.get_allocated_height()
+        r = self.sel_rect()
+        cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+        cr.rectangle(0, 0, W, H)
+        if r:
+            cr.rectangle(*r)
+        cr.set_source_rgba(0, 0, 0, 0.45)
+        cr.fill()
+        if r:
+            cr.set_source_rgb(0.21, 0.52, 0.89)
+            cr.set_line_width(2)
+            cr.rectangle(r[0] - 1, r[1] - 1, r[2] + 2, r[3] + 2)
+            cr.stroke()
+            label = "%d × %d" % (round(r[2] * self.rx), round(r[3] * self.ry))
+            self._pill(cr, label, r[0], max(0, r[1] - 30))
+        else:
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(Pango.FontDescription.from_string("Sans 13"))
+            layout.set_text(self.hint, -1)
+            tw = layout.get_pixel_size()[0]
+            self._pill(cr, self.hint, (W - tw) / 2 - 12, 40)
+
+    @staticmethod
+    def _pill(cr, text, x, y):
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(Pango.FontDescription.from_string("Sans 13"))
+        layout.set_text(text, -1)
+        tw, th = layout.get_pixel_size()
+        cr.set_source_rgba(0, 0, 0, 0.75)
+        cr.rectangle(x, y, tw + 24, th + 12)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.move_to(x + 12, y + 6)
+        PangoCairo.show_layout(cr, layout)
+
+    def on_press(self, _w, ev):
+        if ev.button == 3:
+            self.finish(None)
+        elif ev.button == 1:
+            self.p0 = self.p1 = (ev.x, ev.y)
+            self.area.queue_draw()
+        return True
+
+    def on_motion(self, _w, ev):
+        if self.p0 is not None:
+            self.p1 = (ev.x, ev.y)
+            self.area.queue_draw()
+        return True
+
+    def on_release(self, _w, ev):
+        if ev.button != 1 or self.p0 is None:
+            return True
+        r = self.sel_rect()
+        if r[2] < 4 or r[3] < 4:
+            self.p0 = self.p1 = None
+            self.area.queue_draw()
+            return True
+        self.finish(self._result(r))
+        return True
+
+    def on_key(self, _w, ev):
+        name = Gdk.keyval_name(ev.keyval)
+        if name == "Escape":
+            self.finish(None)
+        elif name in ("Return", "KP_Enter", "space"):
+            self.finish(self._result(None))
+        return True
+
+    def _result(self, r):
+        g = self.monitor_geo()
+        mx, my = self.to_img(0, 0, g)
+        mon = (int(round(mx)), int(round(my)),
+               int(round(g.width * self.rx)), int(round(g.height * self.ry)))
+        if r is None:
+            rect, whole = mon, True
+        else:
+            x0, y0 = self.to_img(r[0], r[1], g)
+            x1, y1 = self.to_img(r[0] + r[2], r[1] + r[3], g)
+            x0, y0 = max(0, int(round(x0))), max(0, int(round(y0)))
+            x1, y1 = min(self.img_w, int(round(x1))), min(self.img_h, int(round(y1)))
+            rect, whole = (x0, y0, x1 - x0, y1 - y0), False
+        return {"rect": rect, "monitor": mon, "whole": whole}
+
+    def finish(self, result):
+        if self.finished:
+            return
+        self.finished = True
+        self.hide()
+        # Give the compositor a moment to remove the overlay before anything is captured.
+        GLib.timeout_add(250, self._emit, result)
+
+    def _emit(self, result):
+        self.destroy()
+        self.on_done(result)
+        return False
+
+
+# --------------------------------------------------------------------------- editor
+
+TOOLS = [
+    ("select", "↖", "Select (V): click to select, drag to move, handles to resize. "
+                    "Double-click text to edit; Delete removes", "v"),
+    ("arrow", "➜", "Arrow (A)", "a"),
+    ("line", "╱", "Straight line (L). Hold Shift to snap to 45°", "l"),
+    ("wave", "∿", "Wavy line (W)", "w"),
+    ("pen", "✎", "Free draw (P)", "p"),
+    ("rect", "▭", "Rectangle (R). Hold Shift for a square", "r"),
+    ("ellipse", "◯", "Ellipse (E). Hold Shift for a circle", "e"),
+    ("text", "T", "Text (T). Click where the text should go", "t"),
+    ("blur", "▒", "Blur (B). For secrets, prefer a filled rectangle", "b"),
+    ("eraser", "⌫", "Eraser (X). Reveals the image underneath annotations", "x"),
+    ("crop", "✂", "Crop (C)", "c"),
+]
+
+
+DOUBLE_CLICK = getattr(Gdk.EventType, "DOUBLE_BUTTON_PRESS", None) or Gdk.EventType._2BUTTON_PRESS
+
+
+class Editor(Gtk.Window):
+    def __init__(self, app, pixbuf, mode=None):
+        super().__init__(title=APP_NAME)
+        self.app, self.mode = app, mode
+        app.hold()
+        self.cfg = load_config()
+        self.base = pixbuf_to_surface(pixbuf)
+        self.ops, self.undo_stack, self.redo_stack = [], [], []
+        self.cache = None
+        self.cur = None
+        self.zoom = 1.0
+        self.tool = self.cfg.get("tool", "arrow")
+        self.dirty = False
+        self.gtk_clip = False
+        self.msg = ""
+        self.sel = self.drag = None
+        self.below = self.below_index = None
+        self.syncing = False
+        self.last_edit = None
+        self._text_sizes = {}
+        self._scratch = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
+        self._cursors, self._cursor_name = {}, None
+        self.set_icon_name("pixtack")
+        self._build_ui()
+        self.color_btn.connect("color-set", lambda *_: self.on_style_changed("color"))
+        self.width_spin.connect("value-changed", lambda *_: self.on_style_changed("width"))
+        self.font_spin.connect("value-changed", lambda *_: self.on_style_changed("font"))
+        self.fill_chk.connect("toggled", lambda *_: self.on_style_changed("fill"))
+        self.rebuild()
+        self._fit_initial()
+        self.connect("key-press-event", self.on_key)
+        self.connect("delete-event", self.on_delete)
+        self.connect("destroy", self.on_destroy)
+        self.show_all()
+        self.present()
+
+    # ---- UI
+    def _build_ui(self):
+        hb = Gtk.HeaderBar(show_close_button=True)
+        hb.props.title = APP_NAME
+        self.set_titlebar(hb)
+
+        # Top toolbar, centred: drawing tools, style, border, history and rotate.
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bar.set_border_width(6)
+        bar.set_halign(Gtk.Align.CENTER)
+        tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        tools.get_style_context().add_class("linked")
+        self.tool_buttons, group = {}, None
+        for name, glyph, tip, _key in TOOLS:
+            b = Gtk.RadioButton.new_with_label_from_widget(group, glyph)
+            group = group or b
+            b.set_mode(False)
+            b.set_tooltip_text(tip)
+            b.connect("toggled", self.on_tool, name)
+            tools.pack_start(b, False, False, 0)
+            self.tool_buttons[name] = b
+        bar.pack_start(tools, False, False, 0)
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 2)
+
+        rgba = Gdk.RGBA()
+        rgba.parse(self.cfg.get("color", "#e01b24"))
+        self.color_btn = Gtk.ColorButton.new_with_rgba(rgba)
+        self.color_btn.set_use_alpha(True)
+        self.color_btn.set_tooltip_text("Colour")
+        bar.pack_start(self.color_btn, False, False, 0)
+        bar.pack_start(Gtk.Label(label="Width"), False, False, 0)
+        self.width_spin = Gtk.SpinButton.new_with_range(1, 60, 1)
+        self.width_spin.set_value(self.cfg.get("width", 4))
+        self.width_spin.set_tooltip_text("Line width; also sets blur and eraser strength")
+        bar.pack_start(self.width_spin, False, False, 0)
+        bar.pack_start(Gtk.Label(label="Font"), False, False, 0)
+        self.font_spin = Gtk.SpinButton.new_with_range(8, 300, 2)
+        self.font_spin.set_value(self.cfg.get("font", 24))
+        bar.pack_start(self.font_spin, False, False, 0)
+        self.fill_chk = Gtk.CheckButton(label="Fill")
+        self.fill_chk.set_tooltip_text("Fill rectangles and ellipses (solid fill is the safe way to redact)")
+        bar.pack_start(self.fill_chk, False, False, 0)
+        bar.pack_start(self._build_border_button(), False, False, 0)
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 2)
+        for icon, tip, cb in (("edit-undo-symbolic", "Undo (Ctrl+Z)", self.undo),
+                              ("edit-redo-symbolic", "Redo (Ctrl+Shift+Z)", self.redo),
+                              ("object-rotate-left-symbolic", "Rotate left", lambda: self.rotate(-1)),
+                              ("object-rotate-right-symbolic", "Rotate right", lambda: self.rotate(1))):
+            b = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+            b.set_tooltip_text(tip)
+            b.connect("clicked", lambda _b, f=cb: f())
+            bar.pack_start(b, False, False, 0)
+
+        # Canvas.
+        self.area = Gtk.DrawingArea()
+        self.area.set_halign(Gtk.Align.CENTER)
+        self.area.set_valign(Gtk.Align.CENTER)
+        self.area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                             | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK
+                             | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        self.area.connect("draw", self.on_draw)
+        self.area.connect("button-press-event", self.on_press)
+        self.area.connect("motion-notify-event", self.on_motion)
+        self.area.connect("button-release-event", self.on_release)
+        self.area.connect("scroll-event", self.on_scroll)
+        self.area.connect("realize", lambda w: w.get_window().set_cursor(
+            Gdk.Cursor.new_from_name(w.get_display(), "crosshair")))
+        scroller = Gtk.ScrolledWindow()
+        scroller.add(self.area)
+
+        # Bottom bar: status on the left, main actions centred, shortcuts on the right.
+        actions = Gtk.ActionBar()
+        self.status_lbl = Gtk.Label(xalign=0)
+        self.status_lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.status_lbl.set_max_width_chars(40)
+        self.status_lbl.get_style_context().add_class("dim-label")
+        actions.pack_start(self.status_lbl)
+
+        centre = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        new_btn = Gtk.MenuButton(label="New")
+        new_btn.set_tooltip_text("Start a new capture")
+        new_btn.set_popup(self._build_new_menu())
+        save_as = Gtk.Button(label="Save as…")
+        save_as.set_tooltip_text("Choose location and format (Ctrl+Shift+S)")
+        save_as.connect("clicked", lambda *_: self.save_as())
+        save = Gtk.Button(label="Save")
+        save.set_tooltip_text("Save PNG to %s (Ctrl+S)" % shots_dir())
+        save.connect("clicked", lambda *_: self.save())
+        copy = Gtk.Button(label="Copy")
+        copy.get_style_context().add_class("suggested-action")
+        copy.set_tooltip_text("Copy to clipboard (Ctrl+C). Ctrl+Enter copies and closes")
+        copy.connect("clicked", lambda *_: self.copy())
+        for b in (new_btn, save_as, save, copy):
+            b.set_size_request(96, -1)
+            centre.pack_start(b, False, False, 0)
+        actions.set_center_widget(centre)
+
+        keys = Gtk.Button.new_from_icon_name("input-keyboard-symbolic", Gtk.IconSize.BUTTON)
+        keys.set_tooltip_text("Keyboard shortcuts (F1)")
+        keys.connect("clicked", lambda *_: ShortcutsDialog(self))
+        actions.pack_end(keys)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        vbox.pack_start(bar, False, False, 0)
+        vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
+        vbox.pack_start(scroller, True, True, 0)
+        vbox.pack_start(actions, False, False, 0)
+        self.add(vbox)
+        start = self.tool if self.tool in self.tool_buttons else "arrow"
+        self.tool_buttons[start].set_active(True)
+        self.tool = start
+
+    def _build_border_button(self):
+        btn = Gtk.MenuButton(label="Border")
+        btn.set_tooltip_text("Add a border around the whole image")
+        pop = Gtk.Popover()
+        grid = Gtk.Grid(column_spacing=8, row_spacing=8)
+        grid.set_border_width(10)
+        self.border_chk = Gtk.CheckButton(label="Add border")
+        self.border_chk.set_active(self.cfg.get("border_on", False))
+        self.border_spin = Gtk.SpinButton.new_with_range(1, 200, 1)
+        self.border_spin.set_value(self.cfg.get("border_width", 6))
+        rgba = Gdk.RGBA()
+        rgba.parse(self.cfg.get("border_color", "#202020"))
+        self.border_color = Gtk.ColorButton.new_with_rgba(rgba)
+        self.border_color.set_use_alpha(True)
+        grid.attach(self.border_chk, 0, 0, 2, 1)
+        grid.attach(Gtk.Label(label="Width", xalign=0), 0, 1, 1, 1)
+        grid.attach(self.border_spin, 1, 1, 1, 1)
+        grid.attach(Gtk.Label(label="Colour", xalign=0), 0, 2, 1, 1)
+        grid.attach(self.border_color, 1, 2, 1, 1)
+        grid.show_all()
+        pop.add(grid)
+        btn.set_popover(pop)
+        self.border_chk.connect("toggled", lambda *_: self.apply_zoom())
+        self.border_spin.connect("value-changed", lambda *_: self.apply_zoom())
+        self.border_color.connect("color-set", lambda *_: self.area.queue_draw())
+        return btn
+
+    def _build_new_menu(self):
+        menu = Gtk.Menu()
+        items = [("Retake (F5)", lambda: self.new_capture(self.mode)) if self.mode else None,
+                 ("Region", lambda: self.new_capture("region")),
+                 ("Full screen", lambda: self.new_capture("full")),
+                 ("Active window", lambda: self.new_capture("window")),
+                 ("Open image…", self.open_image)]
+        for item in items:
+            if item is None:
+                continue
+            mi = Gtk.MenuItem(label=item[0])
+            mi.connect("activate", lambda _m, f=item[1]: f())
+            menu.append(mi)
+        menu.show_all()
+        return menu
+
+    def bpx(self):
+        """Border width in image pixels (0 when the border is off)."""
+        return int(self.border_spin.get_value()) if self.border_chk.get_active() else 0
+
+    def _fit_initial(self):
+        disp = Gdk.Display.get_default()
+        mon = disp.get_primary_monitor() or disp.get_monitor(0)
+        wa = mon.get_workarea()
+        self.sf = max(1, mon.get_scale_factor())
+        b = 2 * self.bpx()
+        w, h = self.base.get_width() + b, self.base.get_height() + b
+        self.zoom = min(1.0 / self.sf, wa.width * 0.9 / w, (wa.height * 0.9 - 170) / h)
+        self.apply_zoom()
+        self.set_default_size(max(900, int(w * self.zoom) + 40), max(420, int(h * self.zoom) + 180))
+
+    def apply_zoom(self):
+        b = 2 * self.bpx()
+        self.area.set_size_request(int(round((self.base.get_width() + b) * self.zoom)),
+                                   int(round((self.base.get_height() + b) * self.zoom)))
+        self.area.queue_draw()
+        self.update_status()
+
+    def zoom_by(self, f):
+        self.zoom = min(8.0, max(0.05, self.zoom * f))
+        self.apply_zoom()
+
+    def update_status(self, msg=None):
+        if msg is not None:
+            self.msg = msg
+        b = 2 * self.bpx()
+        parts = ["%d × %d" % (self.base.get_width() + b, self.base.get_height() + b),
+                 "%d%%" % round(self.zoom * getattr(self, "sf", 1) * 100)]
+        if self.msg:
+            parts.append(self.msg)
+        self.status_lbl.set_text("  ·  ".join(parts))
+        self.status_lbl.set_tooltip_text(self.msg or None)
+
+    # ---- model
+    def rgba(self):
+        c = self.color_btn.get_rgba()
+        return (c.red, c.green, c.blue, c.alpha)
+
+    def _render(self, from_index=0):
+        """Re-render annotations. While dragging, everything below the moving one is reused."""
+        if from_index and self.below is not None and self.below_index == from_index:
+            self.cache = surface_copy(self.below)
+        else:
+            self.cache = surface_copy(self.base)
+            cr = cairo.Context(self.cache)
+            for op in self.ops[:from_index]:
+                self.draw_op(cr, op)
+            if from_index:
+                self.below, self.below_index = surface_copy(self.cache), from_index
+        cr = cairo.Context(self.cache)
+        for op in self.ops[from_index:]:
+            self.draw_op(cr, op)
+
+    def rebuild(self):
+        self.below = None
+        self._render(0)
+        self.apply_zoom()
+
+    def push_history(self):
+        self.undo_stack.append((self.base, list(self.ops)))
+        del self.undo_stack[:-100]
+        self.redo_stack.clear()
+        self.dirty = True
+        self.last_edit = None
+
+    def begin_edit(self, i):
+        """Snapshot for undo, then give op i a private copy that can be changed freely."""
+        self.push_history()
+        self.ops[i] = copy.deepcopy(self.ops[i])
+        return self.ops[i]
+
+    def coalesced_edit(self, i, kind):
+        """Like begin_edit, but repeated small edits (spin clicks, nudges) share one undo step."""
+        now = time.monotonic()
+        if self.last_edit and self.last_edit[:2] == (i, kind) and now - self.last_edit[2] < 1.5:
+            op = self.ops[i]
+        else:
+            op = self.begin_edit(i)
+        self.last_edit = (i, kind, now)
+        return op
+
+    def commit(self, op):
+        self.push_history()
+        self.ops.append(op)
+        self.draw_op(cairo.Context(self.cache), op)
+        if op["type"] != "eraser":
+            self.select(len(self.ops) - 1)
+        self.area.queue_draw()
+
+    def _restore(self, state):
+        self.base, self.ops = state
+        self.sel = None
+        self.drag = None
+        self.last_edit = None
+        self.rebuild()
+
+    def undo(self):
+        if self.undo_stack:
+            self.redo_stack.append((self.base, list(self.ops)))
+            self._restore(self.undo_stack.pop())
+
+    def redo(self):
+        if self.redo_stack:
+            self.undo_stack.append((self.base, list(self.ops)))
+            self._restore(self.redo_stack.pop())
+
+    def transform_ops(self, fn, quarter_turns=0):
+        out = []
+        for op in self.ops:
+            op = copy.deepcopy(op)
+            for k in ("p1", "p2", "pos"):
+                if k in op:
+                    op[k] = fn(op[k])
+            if "pts" in op:
+                op["pts"] = [fn(p) for p in op["pts"]]
+            if op["type"] == "text":
+                op["rot"] = (op.get("rot", 0) + quarter_turns) % 4
+            out.append(op)
+        return out
+
+    def apply_crop(self, x, y, w, h):
+        W, H = self.base.get_width(), self.base.get_height()
+        x0, y0 = max(0, int(round(x))), max(0, int(round(y)))
+        x1, y1 = min(W, int(round(x + w))), min(H, int(round(y + h)))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return
+        new = cairo.ImageSurface(cairo.FORMAT_ARGB32, x1 - x0, y1 - y0)
+        cr = cairo.Context(new)
+        cr.set_source_surface(self.base, -x0, -y0)
+        cr.paint()
+        ops = self.transform_ops(lambda p: (p[0] - x0, p[1] - y0))
+        self.push_history()
+        self._restore((new, ops))
+
+    def rotate(self, direction):
+        w, h = self.base.get_width(), self.base.get_height()
+        new = cairo.ImageSurface(cairo.FORMAT_ARGB32, h, w)
+        cr = cairo.Context(new)
+        if direction > 0:
+            cr.translate(h, 0)
+            cr.rotate(math.pi / 2)
+            fn = lambda p: (h - p[1], p[0])  # noqa: E731
+        else:
+            cr.translate(0, w)
+            cr.rotate(-math.pi / 2)
+            fn = lambda p: (p[1], w - p[0])  # noqa: E731
+        cr.set_source_surface(self.base, 0, 0)
+        cr.paint()
+        ops = self.transform_ops(fn, 1 if direction > 0 else -1)
+        self.push_history()
+        self._restore((new, ops))
+
+    # ---- selection
+    def select(self, i):
+        self.sel = i
+        self.sync_controls(self.ops[i])
+        self.area.queue_draw()
+
+    def deselect(self):
+        if self.sel is not None:
+            self.sel = None
+            self.area.queue_draw()
+
+    def delete_selected(self):
+        if self.sel is None:
+            return
+        self.push_history()
+        del self.ops[self.sel]
+        self.sel = None
+        self.rebuild()
+
+    def sync_controls(self, op):
+        """Show the selected annotation's style in the toolbar."""
+        self.syncing = True
+        try:
+            if "color" in op and op["type"] not in ("blur", "eraser"):
+                rgba = Gdk.RGBA()
+                rgba.red, rgba.green, rgba.blue, rgba.alpha = op["color"]
+                self.color_btn.set_rgba(rgba)
+            if op["type"] == "blur":
+                self.width_spin.set_value(max(1, op["strength"] // 3))
+            elif "width" in op and op["type"] != "eraser":
+                self.width_spin.set_value(op["width"])
+            if op["type"] == "text":
+                self.font_spin.set_value(op["size"])
+            if op["type"] in ("rect", "ellipse"):
+                self.fill_chk.set_active(op["fill"])
+        finally:
+            self.syncing = False
+
+    def on_style_changed(self, prop):
+        if self.syncing or self.sel is None:
+            return
+        t = self.ops[self.sel]["type"]
+        width = self.width_spin.get_value()
+        new = {}
+        if prop == "color" and t not in ("blur", "eraser"):
+            new["color"] = self.rgba()
+        elif prop == "width" and t == "blur":
+            new["strength"] = max(6, int(width * 3))
+        elif prop == "width" and t in ("pen", "line", "arrow", "wave", "rect", "ellipse"):
+            new["width"] = width
+        elif prop == "font" and t == "text":
+            new["size"] = self.font_spin.get_value()
+        elif prop == "fill" and t in ("rect", "ellipse"):
+            new["fill"] = self.fill_chk.get_active()
+        if new:
+            self.coalesced_edit(self.sel, prop).update(new)
+            self.rebuild()
+
+    def nudge(self, dx, dy):
+        op = self.coalesced_edit(self.sel, "nudge")
+        orig = copy.deepcopy(op)
+        self.shift_op(op, orig, dx, dy)
+        self.rebuild()
+
+    @staticmethod
+    def shift_op(op, orig, dx, dy):
+        for k in ("p1", "p2", "pos"):
+            if k in orig:
+                op[k] = (orig[k][0] + dx, orig[k][1] + dy)
+        if "pts" in orig:
+            op["pts"] = [(x + dx, y + dy) for x, y in orig["pts"]]
+
+    @staticmethod
+    def resize_op(op, orig, handle, p):
+        if handle in ("p1", "p2"):
+            op[handle] = p
+            return
+        x, y, w, h = norm_rect(orig["p1"], orig["p2"])
+        x0, y0, x1, y1 = x, y, x + w, y + h
+        if "w" in handle:
+            x0 = p[0]
+        if "e" in handle:
+            x1 = p[0]
+        if "n" in handle:
+            y0 = p[1]
+        if "s" in handle:
+            y1 = p[1]
+        op["p1"], op["p2"] = (x0, y0), (x1, y1)
+
+    def text_size(self, op):
+        key = (op["text"], op["size"])
+        if key not in self._text_sizes:
+            layout = self.text_layout(self._scratch, op)
+            self._text_sizes[key] = layout.get_pixel_size()
+        return self._text_sizes[key]
+
+    def op_bbox(self, op):
+        t = op["type"]
+        if "pts" in op:
+            xs, ys = [p[0] for p in op["pts"]], [p[1] for p in op["pts"]]
+            pad = op["width"] / 2
+            return (min(xs) - pad, min(ys) - pad, max(xs) - min(xs) + 2 * pad, max(ys) - min(ys) + 2 * pad)
+        if t == "text":
+            w, h = self.text_size(op)
+            a = op.get("rot", 0) * math.pi / 2
+            c, s = round(math.cos(a)), round(math.sin(a))
+            x, y = op["pos"]
+            pts = [(x + cx * c - cy * s, y + cx * s + cy * c) for cx, cy in ((0, 0), (w, 0), (0, h), (w, h))]
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+        x, y, w, h = norm_rect(op["p1"], op["p2"])
+        if t in ("line", "arrow", "wave"):
+            pad = op["width"] / 2 + (max(3.0, op["width"] * 1.6) if t == "wave" else 0)
+            return (x - pad, y - pad, w + 2 * pad, h + 2 * pad)
+        return (x, y, w, h)
+
+    @staticmethod
+    def seg_dist(p, a, b):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        if dx == 0 and dy == 0:
+            return math.hypot(p[0] - a[0], p[1] - a[1])
+        t = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy)))
+        return math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy))
+
+    def hit(self, op, p):
+        t = op["type"]
+        if t == "eraser":
+            return False
+        x, y = p
+        tol = op.get("width", 0) / 2 + 6 / self.zoom
+        if t in ("text", "blur") or (t == "rect" and op["fill"]):
+            bx, by, bw, bh = self.op_bbox(op)
+            m = 4 / self.zoom
+            return bx - m <= x <= bx + bw + m and by - m <= y <= by + bh + m
+        if t == "rect":
+            rx, ry, rw, rh = norm_rect(op["p1"], op["p2"])
+            outer = rx - tol <= x <= rx + rw + tol and ry - tol <= y <= ry + rh + tol
+            inner = rx + tol < x < rx + rw - tol and ry + tol < y < ry + rh - tol
+            return outer and not inner
+        if t == "ellipse":
+            ex, ey, ew, eh = norm_rect(op["p1"], op["p2"])
+            rx, ry = max(ew / 2, 1), max(eh / 2, 1)
+            r = math.hypot((x - ex - ew / 2) / rx, (y - ey - eh / 2) / ry)
+            if op["fill"]:
+                return r <= 1 + tol / min(rx, ry)
+            return abs(r - 1) * min(rx, ry) <= tol
+        if t in ("line", "arrow", "wave"):
+            extra = max(3.0, op["width"] * 1.6) if t == "wave" else 0
+            return self.seg_dist(p, op["p1"], op["p2"]) <= tol + extra
+        if t == "pen":
+            pts = op["pts"]
+            if len(pts) == 1:
+                return math.hypot(x - pts[0][0], y - pts[0][1]) <= tol
+            return any(self.seg_dist(p, a, b) <= tol for a, b in zip(pts, pts[1:]))
+        return False
+
+    def op_at(self, p, types=None):
+        for i in range(len(self.ops) - 1, -1, -1):
+            op = self.ops[i]
+            if (types is None or op["type"] in types) and self.hit(op, p):
+                return i
+        return None
+
+    @staticmethod
+    def handles(op):
+        t = op["type"]
+        if t in ("line", "arrow", "wave"):
+            return {"p1": op["p1"], "p2": op["p2"]}
+        if t in ("rect", "ellipse", "blur"):
+            x, y, w, h = norm_rect(op["p1"], op["p2"])
+            return {"nw": (x, y), "n": (x + w / 2, y), "ne": (x + w, y), "e": (x + w, y + h / 2),
+                    "se": (x + w, y + h), "s": (x + w / 2, y + h), "sw": (x, y + h), "w": (x, y + h / 2)}
+        return {}
+
+    def handle_at(self, p):
+        if self.sel is None:
+            return None
+        r = 7 / self.zoom
+        for name, (hx, hy) in self.handles(self.ops[self.sel]).items():
+            if abs(p[0] - hx) <= r and abs(p[1] - hy) <= r:
+                return name
+        return None
+
+    def set_cursor(self, name):
+        if name == self._cursor_name or not self.area.get_window():
+            return
+        if name not in self._cursors:
+            self._cursors[name] = Gdk.Cursor.new_from_name(self.area.get_display(), name)
+        self.area.get_window().set_cursor(self._cursors[name])
+        self._cursor_name = name
+
+    def update_cursor(self, p):
+        h = self.handle_at(p)
+        if h:
+            self.set_cursor({"nw": "nwse-resize", "se": "nwse-resize", "ne": "nesw-resize",
+                             "sw": "nesw-resize", "n": "ns-resize", "s": "ns-resize",
+                             "e": "ew-resize", "w": "ew-resize"}.get(h, "move"))
+        elif self.sel is not None and self.hit(self.ops[self.sel], p):
+            self.set_cursor("move")
+        elif self.tool == "select":
+            self.set_cursor("pointer" if self.op_at(p) is not None else "default")
+        elif self.tool == "text" and self.op_at(p, ("text",)) is not None:
+            self.set_cursor("move")
+        else:
+            self.set_cursor("text" if self.tool == "text" else "crosshair")
+
+    # ---- rendering
+    def draw_op(self, cr, op, preview=False):
+        t = op["type"]
+        cr.save()
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        if t in ("pen", "eraser"):
+            if t == "eraser":
+                cr.set_source_surface(self.base, 0, 0)
+            else:
+                cr.set_source_rgba(*op["color"])
+            cr.set_line_width(op["width"])
+            pts = op["pts"]
+            cr.move_to(*pts[0])
+            if len(pts) == 1:
+                cr.line_to(pts[0][0] + 0.1, pts[0][1])
+            for p in pts[1:]:
+                cr.line_to(*p)
+            cr.stroke()
+        elif t in ("line", "arrow", "wave"):
+            (x1, y1), (x2, y2) = op["p1"], op["p2"]
+            cr.set_source_rgba(*op["color"])
+            cr.set_line_width(op["width"])
+            if t == "line":
+                cr.move_to(x1, y1)
+                cr.line_to(x2, y2)
+                cr.stroke()
+            elif t == "arrow":
+                self._arrow(cr, x1, y1, x2, y2, op["width"])
+            else:
+                self._wave(cr, x1, y1, x2, y2, op["width"])
+        elif t in ("rect", "ellipse"):
+            x, y, w, h = norm_rect(op["p1"], op["p2"])
+            if t == "rect":
+                cr.rectangle(x, y, w, h)
+            elif w > 0 and h > 0:
+                cr.save()
+                cr.translate(x + w / 2, y + h / 2)
+                cr.scale(w / 2, h / 2)
+                cr.arc(0, 0, 1, 0, 2 * math.pi)
+                cr.restore()
+            cr.set_source_rgba(*op["color"])
+            if op["fill"]:
+                cr.fill()
+            else:
+                cr.set_line_width(op["width"])
+                cr.stroke()
+        elif t == "blur":
+            x, y, w, h = norm_rect(op["p1"], op["p2"])
+            paint_blurred(cr, self.cache, x, y, w, h, op["strength"])
+            if preview:
+                self._dashed(cr, x, y, w, h)
+        elif t == "crop":
+            x, y, w, h = norm_rect(op["p1"], op["p2"])
+            cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+            cr.rectangle(0, 0, self.cache.get_width(), self.cache.get_height())
+            cr.rectangle(x, y, w, h)
+            cr.set_source_rgba(0, 0, 0, 0.5)
+            cr.fill()
+            self._dashed(cr, x, y, w, h)
+        elif t == "text":
+            self._text(cr, op)
+        cr.restore()
+
+    def draw_selection(self, cr, op):
+        lw = 1 / self.zoom
+        cr.save()
+        cr.set_line_width(lw)
+        blue = (0.21, 0.52, 0.89)
+        if op["type"] not in ("line", "arrow", "wave"):
+            x, y, w, h = self.op_bbox(op)
+            pad = 4 / self.zoom
+            cr.set_dash([4 * lw, 3 * lw])
+            cr.rectangle(x - pad, y - pad, w + 2 * pad, h + 2 * pad)
+            cr.set_source_rgb(*blue)
+            cr.stroke()
+            cr.set_dash([])
+        s = 8 / self.zoom
+        for hx, hy in self.handles(op).values():
+            cr.rectangle(hx - s / 2, hy - s / 2, s, s)
+            cr.set_source_rgb(1, 1, 1)
+            cr.fill_preserve()
+            cr.set_source_rgb(*blue)
+            cr.stroke()
+        cr.restore()
+
+    def _dashed(self, cr, x, y, w, h):
+        lw = 1.5 / self.zoom
+        cr.set_line_width(lw)
+        cr.set_dash([6 * lw, 4 * lw])
+        cr.rectangle(x, y, w, h)
+        cr.set_source_rgb(1, 1, 1)
+        cr.stroke_preserve()
+        cr.set_dash([6 * lw, 4 * lw], 6 * lw)
+        cr.set_source_rgb(0, 0, 0)
+        cr.stroke()
+        cr.set_dash([])
+
+    @staticmethod
+    def _arrow(cr, x1, y1, x2, y2, w):
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < 1:
+            return
+        a = math.atan2(y2 - y1, x2 - x1)
+        head = min(max(10.0, w * 4), length)
+        half = head * 0.5
+        cr.move_to(x1, y1)
+        cr.line_to(x2 - head * 0.8 * math.cos(a), y2 - head * 0.8 * math.sin(a))
+        cr.stroke()
+        hx, hy = x2 - head * math.cos(a), y2 - head * math.sin(a)
+        cr.move_to(x2, y2)
+        cr.line_to(hx + half * math.sin(a), hy - half * math.cos(a))
+        cr.line_to(hx - half * math.sin(a), hy + half * math.cos(a))
+        cr.close_path()
+        cr.fill()
+
+    @staticmethod
+    def _wave(cr, x1, y1, x2, y2, w):
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < 1:
+            return
+        a = math.atan2(y2 - y1, x2 - x1)
+        amp = max(3.0, w * 1.6)
+        wl = amp * 4
+        n = max(2, int(length / 2))
+        cr.move_to(x1, y1)
+        for i in range(1, n + 1):
+            t = length * i / n
+            off = amp * math.sin(2 * math.pi * t / wl)
+            cr.line_to(x1 + t * math.cos(a) - off * math.sin(a),
+                       y1 + t * math.sin(a) + off * math.cos(a))
+        cr.stroke()
+
+    @staticmethod
+    def text_layout(cr, op):
+        layout = PangoCairo.create_layout(cr)
+        fd = Pango.FontDescription.from_string("Sans Bold")
+        fd.set_absolute_size(op["size"] * Pango.SCALE)
+        layout.set_font_description(fd)
+        layout.set_text(op["text"], -1)
+        return layout
+
+    def _text(self, cr, op):
+        layout = self.text_layout(cr, op)
+        r, g, b, a = op["color"]
+        cr.translate(*op["pos"])
+        cr.rotate(op.get("rot", 0) * math.pi / 2)
+        cr.move_to(0, 0)
+        PangoCairo.layout_path(cr, layout)
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        cr.set_source_rgba(*((0, 0, 0, a * 0.8) if lum > 0.6 else (1, 1, 1, a * 0.8)))
+        cr.set_line_width(max(2.0, op["size"] / 8))
+        cr.stroke_preserve()
+        cr.set_source_rgba(r, g, b, a)
+        cr.fill()
+
+    def on_draw(self, _w, cr):
+        cr.scale(self.zoom, self.zoom)
+        b = self.bpx()
+        if b:
+            cr.set_source_rgba(*self.border_rgba())
+            cr.rectangle(0, 0, self.cache.get_width() + 2 * b, self.cache.get_height() + 2 * b)
+            cr.fill()
+            cr.translate(b, b)
+        cr.set_source_surface(self.cache, 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_GOOD if self.zoom < 1.5 else cairo.FILTER_NEAREST)
+        cr.paint()
+        if self.cur:
+            self.draw_op(cr, self.cur, preview=True)
+        elif self.sel is not None and self.sel < len(self.ops):
+            self.draw_selection(cr, self.ops[self.sel])
+
+    # ---- input
+    def to_img(self, x, y):
+        b = self.bpx()
+        return (x / self.zoom - b, y / self.zoom - b)
+
+    def border_rgba(self):
+        c = self.border_color.get_rgba()
+        return (c.red, c.green, c.blue, c.alpha)
+
+    def on_tool(self, btn, name):
+        if btn.get_active():
+            self.tool = name
+            self.cur = None
+            self._cursor_name = None
+            self.area.queue_draw()
+
+    def on_press(self, _w, ev):
+        if ev.button != 1:
+            return True
+        p = self.to_img(ev.x, ev.y)
+        if ev.type == DOUBLE_CLICK:
+            i = self.op_at(p, ("text",))
+            if i is not None:
+                self.drag = self.cur = None
+                self.select(i)
+                self._text_prompt(self.ops[i]["pos"], edit=i)
+            return True
+        if ev.type != Gdk.EventType.BUTTON_PRESS:
+            return True
+        # 1. Grab the current selection by a handle or its body.
+        if self.sel is not None:
+            h = self.handle_at(p)
+            if h or self.hit(self.ops[self.sel], p):
+                self.start_drag(h or "move", p)
+                return True
+        # 2. The select tool picks any annotation; the text tool picks existing text.
+        if self.tool in ("select", "text"):
+            i = self.op_at(p, ("text",) if self.tool == "text" else None)
+            if i is not None:
+                self.select(i)
+                self.start_drag("move", p)
+                return True
+            if self.tool == "select":
+                self.deselect()
+                return True
+        # 3. Otherwise start a new annotation.
+        self.deselect()
+        width = self.width_spin.get_value()
+        if self.tool == "text":
+            self._text_prompt(p)
+        elif self.tool in ("pen", "eraser"):
+            self.cur = {"type": self.tool, "pts": [p], "color": self.rgba(),
+                        "width": width if self.tool == "pen" else max(8.0, width * 3)}
+        else:
+            self.cur = {"type": self.tool, "p1": p, "p2": p, "color": self.rgba(), "width": width,
+                        "fill": self.fill_chk.get_active(), "strength": max(6, int(width * 3))}
+        self.area.queue_draw()
+        return True
+
+    def start_drag(self, mode, p):
+        self.drag = {"mode": mode, "start": p, "index": self.sel,
+                     "orig": copy.deepcopy(self.ops[self.sel]), "moved": False}
+
+    def on_motion(self, _w, ev):
+        p = self.to_img(ev.x, ev.y)
+        if self.drag:
+            d = self.drag
+            dx, dy = p[0] - d["start"][0], p[1] - d["start"][1]
+            if not d["moved"]:
+                if math.hypot(dx, dy) * self.zoom < 3:
+                    return True
+                self.begin_edit(d["index"])
+                d["moved"] = True
+            op = self.ops[d["index"]]
+            if d["mode"] == "move":
+                self.shift_op(op, d["orig"], dx, dy)
+            else:
+                self.resize_op(op, d["orig"], d["mode"], p)
+            self._render(d["index"])
+            self.area.queue_draw()
+            return True
+        if not self.cur:
+            self.update_cursor(p)
+            return False
+        if "pts" in self.cur:
+            last = self.cur["pts"][-1]
+            if math.hypot(p[0] - last[0], p[1] - last[1]) >= 1:
+                self.cur["pts"].append(p)
+        else:
+            if ev.state & Gdk.ModifierType.SHIFT_MASK:
+                p = self._constrain(self.cur, p)
+            self.cur["p2"] = p
+        self.area.queue_draw()
+        return True
+
+    @staticmethod
+    def _constrain(op, p):
+        x1, y1 = op["p1"]
+        dx, dy = p[0] - x1, p[1] - y1
+        if op["type"] in ("line", "arrow", "wave"):
+            step = math.pi / 4
+            a = round(math.atan2(dy, dx) / step) * step
+            length = math.hypot(dx, dy)
+            return (x1 + length * math.cos(a), y1 + length * math.sin(a))
+        s = max(abs(dx), abs(dy))
+        return (x1 + math.copysign(s, dx), y1 + math.copysign(s, dy))
+
+    def on_release(self, _w, ev):
+        if ev.button != 1:
+            return False
+        if self.drag:
+            self.drag = None
+            self.below = None
+            self.area.queue_draw()
+            return True
+        if not self.cur:
+            return False
+        op, self.cur = self.cur, None
+        if "p1" in op:
+            x, y, w, h = norm_rect(op["p1"], op["p2"])
+            if op["type"] in ("line", "arrow", "wave"):
+                if math.hypot(w, h) < 3:
+                    self.area.queue_draw()
+                    return True
+            elif w < 2 or h < 2:
+                self.area.queue_draw()
+                return True
+            if op["type"] == "crop":
+                self.apply_crop(x, y, w, h)
+                return True
+        self.commit(op)
+        return True
+
+    def on_scroll(self, _w, ev):
+        if not ev.state & Gdk.ModifierType.CONTROL_MASK:
+            return False
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self.zoom_by(1.15)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self.zoom_by(1 / 1.15)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            ok, _dx, dy = ev.get_scroll_deltas()
+            if ok and dy:
+                self.zoom_by(1.15 if dy < 0 else 1 / 1.15)
+        return True
+
+    def _text_prompt(self, p, edit=None):
+        pop = Gtk.Popover(relative_to=self.area)
+        rect = Gdk.Rectangle()
+        b = self.bpx()
+        rect.x, rect.y = int((p[0] + b) * self.zoom), int((p[1] + b) * self.zoom)
+        rect.width = rect.height = 1
+        pop.set_pointing_to(rect)
+        pop.set_position(Gtk.PositionType.BOTTOM)
+        entry = Gtk.Entry(placeholder_text="Type text, then press Enter")
+        entry.set_width_chars(30)
+        for side in ("start", "end", "top", "bottom"):
+            getattr(entry, "set_margin_" + side)(6)
+        if edit is not None:
+            entry.set_text(self.ops[edit]["text"])
+        pop.add(entry)
+        state = {"done": False}
+
+        def finish(commit):
+            if state["done"]:
+                return
+            state["done"] = True
+            text = entry.get_text()
+            if not commit:
+                return
+            if edit is None:
+                if text.strip():
+                    self.commit({"type": "text", "pos": p, "text": text, "color": self.rgba(),
+                                 "size": self.font_spin.get_value()})
+            elif edit < len(self.ops) and self.ops[edit]["type"] == "text":
+                if not text.strip():
+                    self.sel = edit
+                    self.delete_selected()
+                elif text != self.ops[edit]["text"]:
+                    self.begin_edit(edit)["text"] = text
+                    self.rebuild()
+
+        def on_key(_e, ev):
+            if Gdk.keyval_name(ev.keyval) == "Escape":
+                finish(False)
+                pop.popdown()
+                return True
+            return False
+
+        entry.connect("activate", lambda *_: (finish(True), pop.popdown()))
+        entry.connect("key-press-event", on_key)
+        pop.connect("closed", lambda *_: (finish(True), GLib.idle_add(pop.destroy)))
+        pop.show_all()
+        entry.grab_focus()
+        if edit is not None:
+            entry.select_region(0, -1)
+
+    def on_key(self, _w, ev):
+        if isinstance(self.get_focus(), Gtk.Entry):
+            return False
+        ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
+        shift = ev.state & Gdk.ModifierType.SHIFT_MASK
+        name = Gdk.keyval_name(Gdk.keyval_to_lower(ev.keyval)) or ""
+        if ctrl:
+            actions = {
+                "c": self.copy,
+                "s": self.save_as if shift else self.save,
+                "z": self.redo if shift else self.undo,
+                "y": self.redo,
+                "Return": lambda: self.copy(close=True),
+                "KP_Enter": lambda: self.copy(close=True),
+                "plus": lambda: self.zoom_by(1.25), "equal": lambda: self.zoom_by(1.25),
+                "KP_Add": lambda: self.zoom_by(1.25),
+                "minus": lambda: self.zoom_by(0.8), "KP_Subtract": lambda: self.zoom_by(0.8),
+                "0": lambda: (setattr(self, "zoom", 1.0 / self.sf), self.apply_zoom()),
+            }
+            if name in actions:
+                actions[name]()
+                return True
+            return False
+        if self.sel is not None and not self.drag:
+            if name in ("Delete", "BackSpace", "KP_Delete"):
+                self.delete_selected()
+                return True
+            step = 10 if shift else 1
+            moves = {"Left": (-step, 0), "Right": (step, 0), "Up": (0, -step), "Down": (0, step)}
+            if name in moves:
+                self.nudge(*moves[name])
+                return True
+        if name == "Escape":
+            if self.cur:
+                self.cur = None
+                self.area.queue_draw()
+            elif self.sel is not None:
+                self.deselect()
+            else:
+                self.close_editor()
+            return True
+        if name == "F5" and self.mode:
+            self.new_capture(self.mode)
+            return True
+        if name in ("F1", "question"):
+            ShortcutsDialog(self)
+            return True
+        for tool, _g, _t, key in TOOLS:
+            if name == key:
+                self.tool_buttons[tool].set_active(True)
+                return True
+        return False
+
+    # ---- output
+    def output_surface(self):
+        b = self.bpx()
+        if not b:
+            return self.cache
+        out = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.cache.get_width() + 2 * b,
+                                 self.cache.get_height() + 2 * b)
+        cr = cairo.Context(out)
+        cr.set_source_rgba(*self.border_rgba())
+        cr.paint()
+        cr.set_source_surface(self.cache, b, b)
+        cr.paint()
+        return out
+
+    def png_bytes(self):
+        buf = io.BytesIO()
+        self.output_surface().write_to_png(buf)
+        return buf.getvalue()
+
+    def copy(self, close=False):
+        if clipboard_set_bytes(self.png_bytes(), "image/png"):
+            self.gtk_clip = False
+        else:
+            cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            out = self.output_surface()
+            cb.set_image(Gdk.pixbuf_get_from_surface(out, 0, 0, out.get_width(), out.get_height()))
+            cb.store()
+            self.gtk_clip = True
+        self.dirty = False
+        self.update_status("Copied to clipboard")
+        if close:
+            self.destroy()
+
+    def save(self):
+        self._write(os.path.join(shots_dir(), "Screenshot_%s.png" % stamp()))
+
+    def save_as(self):
+        dlg = Gtk.FileChooserNative.new("Save screenshot", self, Gtk.FileChooserAction.SAVE,
+                                        "_Save", "_Cancel")
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.set_current_folder(shots_dir())
+        dlg.set_current_name("Screenshot_%s.png" % stamp())
+        for label, pattern in (("PNG image", "*.png"), ("JPEG image", "*.jpg")):
+            f = Gtk.FileFilter()
+            f.set_name(label)
+            f.add_pattern(pattern)
+            dlg.add_filter(f)
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            self._write(dlg.get_filename())
+        dlg.destroy()
+
+    def _write(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        src = self.output_surface()
+        try:
+            if ext in (".jpg", ".jpeg"):
+                w, h = src.get_width(), src.get_height()
+                rgb = cairo.ImageSurface(cairo.FORMAT_RGB24, w, h)
+                cr = cairo.Context(rgb)
+                cr.set_source_rgb(1, 1, 1)
+                cr.paint()
+                cr.set_source_surface(src, 0, 0)
+                cr.paint()
+                Gdk.pixbuf_get_from_surface(rgb, 0, 0, w, h).savev(path, "jpeg", ["quality"], ["92"])
+            else:
+                if ext != ".png":
+                    path += ".png"
+                src.write_to_png(path)
+        except (GLib.Error, OSError, cairo.Error) as e:
+            error_dialog("Could not save %s:\n%s" % (path, e), self)
+            return
+        self.dirty = False
+        self.update_status("Saved " + path)
+
+    # ---- lifecycle
+    def _confirm_replace(self):
+        return not self.dirty or confirm_dialog(
+            self, "Discard this screenshot?", "Your edits have not been saved or copied.", "_Discard")
+
+    def new_capture(self, mode):
+        if not mode or not self._confirm_replace():
+            return
+        self.app.capture(mode)
+        self.dirty = False
+        self.destroy()
+
+    def open_image(self):
+        if not self._confirm_replace():
+            return
+        dlg = Gtk.FileChooserNative.new("Open image", self, Gtk.FileChooserAction.OPEN, "_Open", "_Cancel")
+        f = Gtk.FileFilter()
+        f.set_name("Images")
+        f.add_pixbuf_formats()
+        dlg.add_filter(f)
+        path = dlg.get_filename() if dlg.run() == Gtk.ResponseType.ACCEPT else None
+        dlg.destroy()
+        if path:
+            self.app.open_file(path)
+            self.dirty = False
+            self.destroy()
+
+    def close_editor(self):
+        if self.dirty and not confirm_dialog(self, "Close without saving?",
+                                             "Your edits have not been saved or copied.", "_Discard"):
+            return
+        self.destroy()
+
+    def on_delete(self, *_):
+        if self.dirty and not confirm_dialog(self, "Close without saving?",
+                                             "Your edits have not been saved or copied.", "_Discard"):
+            return True
+        return False
+
+    def on_destroy(self, *_):
+        c = self.rgba()
+        cfg = load_config()
+        cfg.update({"tool": self.tool if self.tool != "crop" else "arrow",
+                    "color": "rgba(%d,%d,%d,%.3f)" % (c[0] * 255, c[1] * 255, c[2] * 255, c[3]),
+                    "width": self.width_spin.get_value(), "font": self.font_spin.get_value(),
+                    "border_on": self.border_chk.get_active(),
+                    "border_width": self.border_spin.get_value(),
+                    "border_color": self.border_color.get_rgba().to_string()})
+        save_config(cfg)
+        if self.gtk_clip:
+            self.app.linger_for_clipboard()
+        self.app.release()
+
+
+class ShortcutsDialog(Gtk.Window):
+    """Reference for editor keys, plus editable GNOME global shortcuts."""
+
+    EDITOR_KEYS = [
+        ("<Ctrl>c", "Copy to clipboard"),
+        ("<Ctrl>Return", "Copy and close"),
+        ("<Ctrl>s", "Save PNG to Screenshots"),
+        ("<Ctrl><Shift>s", "Save as"),
+        ("<Ctrl>z", "Undo"),
+        ("<Ctrl><Shift>z", "Redo"),
+        ("<Ctrl>plus", "Zoom in (or Ctrl+scroll)"),
+        ("<Ctrl>minus", "Zoom out"),
+        ("<Ctrl>0", "Actual size"),
+        ("Delete", "Delete selected annotation"),
+        ("Left", "Nudge selection (arrow keys; Shift for 10 px)"),
+        ("F5", "Retake"),
+        ("F1", "This window"),
+        ("Escape", "Cancel drawing, then close"),
+    ]
+
+    def __init__(self, parent):
+        super().__init__(title="Keyboard shortcuts")
+        self.set_transient_for(parent)
+        self.set_modal(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_resizable(False)
+        self.capturing = None
+        self.saved = {}
+        self.grab = None
+        self.message = ""
+        self.connect("key-press-event", self.on_key)
+        self.connect("destroy", self.on_destroy)
+        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=24)
+        outer.set_border_width(18)
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left.pack_start(self._heading("Editor"), False, False, 0)
+        left.pack_start(self._grid(self.EDITOR_KEYS), False, False, 0)
+        left.pack_start(self._heading("Tools"), False, False, 6)
+        left.pack_start(self._grid([(k, t.split(" (")[0].split(".")[0]) for _n, _g, t, k in TOOLS]),
+                        False, False, 0)
+        note = Gtk.Label(xalign=0, label="Hold Shift while drawing for 45° lines, squares and circles.")
+        note.get_style_context().add_class("dim-label")
+        left.pack_start(note, False, False, 6)
+        outer.pack_start(left, False, False, 0)
+        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        right.pack_start(self._heading("Global (work anywhere)"), False, False, 0)
+        self.global_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        right.pack_start(self.global_box, False, False, 0)
+        outer.pack_start(right, False, False, 0)
+        self.add(outer)
+        self._refresh_global()
+        self.show_all()
+        self.present()
+
+    @staticmethod
+    def _heading(text):
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup("<b>%s</b>" % GLib.markup_escape_text(text))
+        return lbl
+
+    @staticmethod
+    def _grid(rows):
+        grid = Gtk.Grid(column_spacing=14, row_spacing=4)
+        for i, (accel, desc) in enumerate(rows):
+            key = Gtk.ShortcutLabel(accelerator=accel) if accel else Gtk.Label(label="(off)")
+            key.set_halign(Gtk.Align.START)
+            grid.attach(key, 0, i, 1, 1)
+            grid.attach(Gtk.Label(label=desc, xalign=0), 1, i, 1, 1)
+        return grid
+
+    def _refresh_global(self):
+        for child in self.global_box.get_children():
+            child.destroy()
+        if not gnome_shortcuts_supported():
+            lbl = Gtk.Label(xalign=0, wrap=True, max_width_chars=40, label=(
+                "Global shortcuts can't be set automatically on this desktop. Add custom shortcuts in "
+                "your keyboard settings that run: pixtack --region, --full, --gif or --video."))
+            self.global_box.pack_start(lbl, False, False, 0)
+            self.global_box.show_all()
+            return False
+        bindings = gnome_shortcut_bindings()
+        grid = Gtk.Grid(column_spacing=14, row_spacing=6)
+        for i, (key, name, _arg, _default) in enumerate(SHORTCUTS):
+            grid.attach(Gtk.Label(label=name, xalign=0), 0, i, 1, 1)
+            btn = Gtk.Button()
+            btn.set_size_request(180, -1)
+            btn.set_tooltip_text("Click, then press the new keys. Esc cancels, Backspace disables.")
+            if self.capturing == key:
+                btn.add(Gtk.Label(label="Press new keys…"))
+                btn.get_style_context().add_class("suggested-action")
+            elif bindings.get(key):
+                btn.add(Gtk.ShortcutLabel(accelerator=bindings[key]))
+            else:
+                off = Gtk.Label(label="Disabled")
+                off.get_style_context().add_class("dim-label")
+                btn.add(off)
+            btn.set_sensitive(self.capturing in (None, key))
+            btn.connect("clicked", lambda _b, k=key: self.start_capture(k))
+            grid.attach(btn, 1, i, 1, 1)
+        self.global_box.pack_start(grid, False, False, 0)
+
+        msg = self.message or "Click a shortcut to change it."
+        lbl = Gtk.Label(xalign=0, wrap=True, max_width_chars=44, label=msg)
+        if not self.message:
+            lbl.get_style_context().add_class("dim-label")
+        self.global_box.pack_start(lbl, False, False, 4)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        enabled = any(bindings.values())
+        toggle = Gtk.Button(label="Disable all" if enabled else "Enable all")
+        if not enabled:
+            toggle.get_style_context().add_class("suggested-action")
+        toggle.connect("clicked", lambda *_: self._toggle_all(enabled))
+        reset = Gtk.Button(label="Reset to defaults")
+        reset.connect("clicked", lambda *_: self._reset_defaults())
+        for b in (toggle, reset):
+            b.set_sensitive(self.capturing is None)
+            row.pack_start(b, False, False, 0)
+        self.global_box.pack_start(row, False, False, 0)
+        self.global_box.show_all()
+        return False
+
+    def _redraw(self, message=None):
+        if message is not None:
+            self.message = message
+        GLib.idle_add(self._refresh_global)
+
+    def _toggle_all(self, enabled):
+        skipped = apply_gnome_shortcuts(remove=enabled) or []
+        msg = "Global shortcuts disabled." if enabled else "Global shortcuts enabled."
+        if skipped:
+            msg += " Skipped: " + "; ".join("%s (key used by '%s')" % s for s in skipped)
+        self._redraw(msg)
+
+    def _reset_defaults(self):
+        cfg = load_config()
+        cfg.pop("global_keys", None)
+        save_config(cfg)
+        enabled = any(gnome_shortcut_bindings().values())
+        skipped = apply_gnome_shortcuts() if enabled else []
+        msg = "Defaults restored."
+        if skipped:
+            msg += " Skipped: " + "; ".join("%s (key used by '%s')" % s for s in skipped)
+        self._redraw(msg)
+
+    # ---- recording a new key combination
+    def start_capture(self, key):
+        if self.capturing:
+            return
+        self.capturing = key
+        self.saved = gnome_shortcut_bindings()
+        # Blank Pixtack's own bindings so GNOME doesn't swallow them while we listen.
+        for k, b in self.saved.items():
+            if b:
+                _custom(k).set_string("binding", "")
+        Gio.Settings.sync()
+        self.grab = None
+        try:
+            seat = self.get_display().get_default_seat()
+            if seat.grab(self.get_window(), Gdk.SeatCapabilities.KEYBOARD, False,
+                         None, None, None, None) == Gdk.GrabStatus.SUCCESS:
+                self.grab = seat
+        except (TypeError, GLib.Error):
+            pass
+        self._redraw("Press the new keys. Esc cancels, Backspace disables this shortcut.")
+
+    def end_capture(self, binding, cancel=False):
+        key, self.capturing = self.capturing, None
+        if self.grab:
+            self.grab.ungrab()
+            self.grab = None
+        for k, b in self.saved.items():
+            if k != key and b:
+                _custom(k).set_string("binding", b)
+        name = {k: n for k, n, _a, _d in SHORTCUTS}[key]
+        if cancel:
+            if self.saved.get(key):
+                _custom(key).set_string("binding", self.saved[key])
+            msg = "No change."
+        elif not binding:
+            set_gnome_shortcut(key, None)
+            msg = "%s disabled." % name
+        else:
+            set_gnome_shortcut(key, binding)
+            remember_binding(key, binding)
+            k, m = Gtk.accelerator_parse(binding)
+            msg = "%s set to %s." % (name, Gtk.accelerator_get_label(k, m))
+        Gio.Settings.sync()
+        self._redraw(msg)
+
+    def on_key(self, _w, ev):
+        if not self.capturing:
+            if Gdk.keyval_name(ev.keyval) == "Escape":
+                self.destroy()
+                return True
+            return False
+        if ev.is_modifier:
+            return True
+        kv = Gdk.keyval_to_lower(ev.keyval)
+        name = Gdk.keyval_name(kv) or ""
+        state = ev.state
+        try:
+            state = Gdk.Keymap.get_for_display(self.get_display()).add_virtual_modifiers(state)
+        except (TypeError, AttributeError):
+            pass
+        mods = int(state) & ACCEL_MASK
+        if not mods and name == "Escape":
+            self.end_capture(None, cancel=True)
+            return True
+        if not mods and name == "BackSpace":
+            self.end_capture(None)
+            return True
+        fkey = (name.startswith("F") and name[1:].isdigit()) or name == "Print"
+        if not fkey and not (mods & ~int(Gdk.ModifierType.SHIFT_MASK)):
+            self._redraw("Include Super, Ctrl or Alt (for example Super+Shift+S). "
+                         "Esc cancels, Backspace disables.")
+            return True
+        accel = Gtk.accelerator_name(kv, Gdk.ModifierType(mods))
+        label = Gtk.accelerator_get_label(kv, Gdk.ModifierType(mods))
+        own = {k: n for k, n, _a, _d in SHORTCUTS}
+        clash = next((own[k] for k, b in self.saved.items()
+                      if k != self.capturing and b and _norm(b) == _norm(accel)), None)
+        clash = clash and "Pixtack: " + clash
+        clash = clash or find_conflict(accel, ignore=list(own))
+        if clash:
+            self._redraw("%s is already used by '%s'. Try another combination." % (label, clash))
+            return True
+        self.end_capture(accel)
+        return True
+
+    def on_destroy(self, *_):
+        if self.capturing:
+            self.end_capture(None, cancel=True)
+
+
+# --------------------------------------------------------------------------- recording
+
+class RecorderError(Exception):
+    pass
+
+
+class RecControl(Gtk.Window):
+    def __init__(self, rec):
+        super().__init__(title="Recording · " + APP_NAME)
+        self.rec = rec
+        self.set_icon_name("pixtack")
+        self.set_keep_above(True)
+        self.set_resizable(False)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box.set_border_width(8)
+        self.lbl = Gtk.Label()
+        self.stop_btn = Gtk.Button(label="Stop")
+        self.stop_btn.get_style_context().add_class("destructive-action")
+        self.stop_btn.connect("clicked", lambda *_: rec.stop())
+        self.discard_btn = Gtk.Button(label="Discard")
+        self.discard_btn.connect("clicked", lambda *_: rec.stop(discard=True))
+        box.pack_start(self.lbl, False, False, 4)
+        box.pack_start(self.stop_btn, False, False, 0)
+        box.pack_start(self.discard_btn, False, False, 0)
+        self.add(box)
+        self.connect("delete-event", lambda *_: (rec.stop(), True)[1])
+        self._tick()
+        self.show_all()
+        GLib.timeout_add(500, self._tick)
+
+    def _tick(self):
+        if self.rec.stopping:
+            return False
+        s = int(time.monotonic() - self.rec.started_at)
+        self.lbl.set_markup("<span foreground='#e01b24'>●</span>  %02d:%02d" % (s // 60, s % 60))
+        return True
+
+    def set_status(self, text):
+        self.lbl.set_text(text)
+        self.stop_btn.set_sensitive(False)
+        self.discard_btn.set_sensitive(False)
+        self.deiconify()
+        self.present()
+
+    def place(self, sel):
+        """Keep the control out of the recording; minimise it if that is not possible."""
+        if session_is_wayland():
+            GLib.timeout_add(150, lambda: (self.iconify(), False)[1])
+            return False
+        w, h = self.get_size()
+        mx, my, mw, mh = sel["monitor"]
+        rx, ry, rw, rh = sel["rect"]
+        m = 16
+        for x, y in ((mx + mw - w - m, my + mh - h - 60), (mx + mw - w - m, my + m + 40),
+                     (mx + m, my + mh - h - 60), (mx + m, my + m + 40)):
+            if x + w < rx or x > rx + rw or y + h < ry or y > ry + rh:
+                self.move(x, y)
+                return True
+        GLib.timeout_add(150, lambda: (self.iconify(), False)[1])
+        return False
+
+
+class Recorder:
+    def __init__(self, app, gif):
+        self.app, self.gif = app, gif
+        self.fps = 15 if gif else 30
+        self.tmpdir = tempfile.mkdtemp(prefix="pixtack-")
+        ext = "gif" if gif else "mp4"
+        self.final = os.path.join(videos_dir(), "Recording_%s.%s" % (stamp(), ext))
+        self.proc = self.pipeline = self.session = self.portal = None
+        self.pw_fd = None
+        self.closed_sub = None
+        self.stopping = self.discard = self.finalised = False
+        self.started_at = time.monotonic()
+        self.sel = None
+        self.control = None
+        self.raw = None
+
+    # ---- start
+    def begin(self, sel):
+        self.sel = sel
+        try:
+            if session_is_wayland():
+                self._start_wayland()
+            else:
+                self._start_x11()
+        except RecorderError as e:
+            self._cleanup_tmp()
+            if str(e):
+                error_dialog(str(e))
+            self.app.recorder = None
+            self.app.release()
+            return
+        with open(PIDFILE, "w") as fh:
+            fh.write(str(os.getpid()))
+        self.started_at = time.monotonic()
+        self.control = RecControl(self)
+        if not self.control.place(sel):
+            notify("Recording started",
+                   "Stop it from the Pixtack window in the dock, the screen-sharing indicator, "
+                   "or run: pixtack --stop")
+
+    def _start_x11(self):
+        if not have("ffmpeg"):
+            raise RecorderError("Recording needs ffmpeg:\n  sudo apt install ffmpeg")
+        x, y, w, h = self.sel["rect"]
+        w, h = w - w % 2, h - h % 2
+        if w < 16 or h < 16:
+            raise RecorderError("The selected area is too small to record.")
+        self.raw = os.path.join(self.tmpdir, "raw.mkv")
+        if self.gif:
+            enc = ["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0"]
+        else:
+            enc = ["-c:v", "libx264", "-preset", "superfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-f", "x11grab", "-draw_mouse", "1", "-framerate", str(self.fps),
+               "-video_size", "%dx%d" % (w, h),
+               "-i", "%s+%d,%d" % (os.environ.get("DISPLAY", ":0"), x, y)] + enc + [self.raw]
+        self.log = open(os.path.join(self.tmpdir, "ffmpeg.log"), "wb")
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=DEVNULL, stderr=self.log)
+        GLib.timeout_add(300, self._watch_proc)
+
+    def _watch_proc(self):
+        if self.proc.poll() is None:
+            return True
+        if not self.stopping:
+            self.stopping = True
+            notify("Recording failed", self._log_tail())
+            error_dialog("ffmpeg stopped unexpectedly:\n" + self._log_tail())
+            self.discard = True
+        self._finalise()
+        return False
+
+    def _log_tail(self):
+        try:
+            with open(os.path.join(self.tmpdir, "ffmpeg.log"), "rb") as fh:
+                return fh.read()[-600:].decode(errors="replace").strip() or "(no output)"
+        except OSError:
+            return "(no log)"
+
+    def _start_wayland(self):
+        try:
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+        except (ValueError, ImportError):
+            raise RecorderError("Recording on Wayland needs GStreamer:\n"
+                                "  sudo apt install gir1.2-gstreamer-1.0 gstreamer1.0-pipewire")
+        Gst.init(None)
+        self.Gst = Gst
+        if not Gst.ElementFactory.find("pipewiresrc"):
+            raise RecorderError("Recording on Wayland needs the PipeWire GStreamer plugin:\n"
+                                "  sudo apt install gstreamer1.0-pipewire")
+        if not Gst.ElementFactory.find("vp8enc"):
+            raise RecorderError("Missing vp8enc:\n  sudo apt install gstreamer1.0-plugins-good")
+        iface = "org.freedesktop.portal.ScreenCast"
+        try:
+            p = self.portal = Portal()
+            code, res = p.request(iface, "CreateSession", lambda t: GLib.Variant("(a{sv})", ({
+                "handle_token": GLib.Variant("s", t),
+                "session_handle_token": GLib.Variant("s", Portal.token())},)))
+            if code != 0:
+                raise RecorderError("The screen-cast portal refused to start a session.")
+            self.session = res["session_handle"]
+            self.closed_sub = p.bus.signal_subscribe(
+                Portal.BUS, "org.freedesktop.portal.Session", "Closed", self.session, None,
+                Gio.DBusSignalFlags.NONE, lambda *_: self.stop())
+            types = (p.get_property(iface, "AvailableSourceTypes") or 1) & 3 or 1
+            cursor = p.get_property(iface, "AvailableCursorModes") or 0
+            opts = {"types": GLib.Variant("u", types), "multiple": GLib.Variant("b", False)}
+            if cursor & 2:
+                opts["cursor_mode"] = GLib.Variant("u", 2)
+
+            def sel_args(t):
+                o = dict(opts)
+                o["handle_token"] = GLib.Variant("s", t)
+                return GLib.Variant("(oa{sv})", (self.session, o))
+
+            code, _ = p.request(iface, "SelectSources", sel_args)
+            if code != 0:
+                raise RecorderError("")
+            code, res = p.request(iface, "Start", lambda t: GLib.Variant(
+                "(osa{sv})", (self.session, "", {"handle_token": GLib.Variant("s", t)})))
+            if code != 0 or not res.get("streams"):
+                raise RecorderError("")  # user cancelled the picker
+            node = res["streams"][0][0]
+            reply, fds = p.bus.call_with_unix_fd_list_sync(
+                Portal.BUS, Portal.PATH, iface, "OpenPipeWireRemote",
+                GLib.Variant("(oa{sv})", (self.session, {})), GLib.VariantType("(h)"),
+                Gio.DBusCallFlags.NONE, -1, None, None)
+            self.pw_fd = fds.get(reply.unpack()[0])
+        except GLib.Error as e:
+            self._close_session()
+            raise RecorderError("Screen-cast portal error: %s" % e.message)
+        except RecorderError:
+            self._close_session()
+            raise
+
+        self.raw = os.path.join(self.tmpdir, "raw.webm")
+        threads = max(1, min(8, os.cpu_count() or 2))
+        rate = 3000000 if self.gif else 8000000
+        pipeline = None
+        for extra in ("keepalive-time=1000", ""):
+            desc = ("pipewiresrc fd=%d path=%d do-timestamp=true %s ! videorate ! "
+                    "video/x-raw,framerate=%d/1 ! videoconvert ! queue ! "
+                    "vp8enc deadline=1 cpu-used=8 threads=%d target-bitrate=%d ! queue ! "
+                    "webmmux ! filesink name=sink" % (self.pw_fd, node, extra, self.fps, threads, rate))
+            try:
+                pipeline = Gst.parse_launch(desc)
+                break
+            except GLib.Error:
+                continue
+        if pipeline is None:
+            self._close_session()
+            raise RecorderError("Could not build the GStreamer recording pipeline.")
+        pipeline.get_by_name("sink").set_property("location", self.raw)
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_gst_message)
+        self.pipeline = pipeline
+        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            self._close_session()
+            raise RecorderError("GStreamer could not start recording.")
+
+    def _on_gst_message(self, _bus, msg):
+        Gst = self.Gst
+        if msg.type == Gst.MessageType.EOS:
+            self._gst_done()
+        elif msg.type == Gst.MessageType.ERROR:
+            err, _dbg = msg.parse_error()
+            if not self.stopping and time.monotonic() - self.started_at < 2:
+                error_dialog("Recording failed: %s" % err.message)
+                self.discard = True
+            self.stopping = True
+            self._gst_done()
+
+    def _gst_done(self):
+        if self.pipeline is None:
+            return
+        self.pipeline.set_state(self.Gst.State.NULL)
+        self.pipeline = None
+        if self.pw_fd is not None:
+            try:
+                os.close(self.pw_fd)
+            except OSError:
+                pass
+            self.pw_fd = None
+        self._finalise()
+
+    def _close_session(self):
+        if self.portal and self.closed_sub:
+            self.portal.bus.signal_unsubscribe(self.closed_sub)
+            self.closed_sub = None
+        if self.portal and self.session:
+            try:
+                self.portal.bus.call_sync(Portal.BUS, self.session, "org.freedesktop.portal.Session",
+                                          "Close", None, None, Gio.DBusCallFlags.NONE, -1, None)
+            except GLib.Error:
+                pass
+            self.session = None
+
+    # ---- stop
+    def stop(self, discard=False):
+        if self.stopping:
+            return
+        self.stopping = True
+        self.discard = discard
+        if self.control:
+            self.control.set_status("Finishing…")
+        if self.proc:
+            try:
+                self.proc.stdin.write(b"q")
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self.proc.send_signal(signal.SIGINT)
+            GLib.timeout_add_seconds(8, self._force_kill)
+        elif self.pipeline:
+            self.pipeline.send_event(self.Gst.Event.new_eos())
+            GLib.timeout_add_seconds(8, lambda: (self._gst_done(), False)[1])
+
+    def _force_kill(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+        return False
+
+    # ---- finish
+    def _finalise(self):
+        if self.finalised:
+            return
+        self.finalised = True
+        self._close_session()
+        try:
+            os.remove(PIDFILE)
+        except OSError:
+            pass
+        if self.discard or not self.raw or not os.path.exists(self.raw) \
+                or os.path.getsize(self.raw) == 0:
+            self._done(None)
+            return
+        if self.control:
+            self.control.set_status("Converting…" if self.gif else "Saving…")
+        cmd = self._post_command()
+        if cmd is None:
+            return
+        self.post = subprocess.Popen(cmd, stdout=DEVNULL, stderr=self.log_handle())
+        GLib.timeout_add(250, self._watch_post)
+
+    def log_handle(self):
+        return open(os.path.join(self.tmpdir, "ffmpeg.log"), "ab")
+
+    def _wayland_crop(self):
+        if not session_is_wayland() or self.sel["whole"] or not have("ffprobe"):
+            return None
+        try:
+            out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                  "-show_entries", "stream=width,height", "-of", "csv=p=0", self.raw],
+                                 capture_output=True, text=True, timeout=20).stdout
+            vw, vh = [int(v) for v in out.strip().split(",")[:2]]
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        mx, my, mw, mh = self.sel["monitor"]
+        x, y, w, h = self.sel["rect"]
+        if abs(vw / vh - mw / mh) > 0.02:
+            return None  # a window (or another monitor shape) was picked; keep it whole
+        s = vw / mw
+        cx, cy = max(0, int((x - mx) * s)), max(0, int((y - my) * s))
+        cw, ch = min(vw - cx, int(w * s)), min(vh - cy, int(h * s))
+        if cw < 16 or ch < 16:
+            return None
+        return "crop=%d:%d:%d:%d" % (cw, ch, cx, cy)
+
+    def _post_command(self):
+        if not have("ffmpeg"):
+            if self.gif:
+                kept = os.path.splitext(self.final)[0] + ".webm"
+                shutil.move(self.raw, kept)
+                self._done(kept, "GIF conversion needs ffmpeg (sudo apt install ffmpeg); kept WebM.")
+            else:
+                self.final = os.path.splitext(self.final)[0] + ".webm"
+                shutil.move(self.raw, self.final)
+                self._done(self.final)
+            return None
+        crop = self._wayland_crop()
+        pre = (crop + ",") if crop else ""
+        base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", self.raw]
+        if self.gif:
+            vf = (pre + "fps=%d,scale='min(iw,1280)':-2:flags=lanczos,split[a][b];"
+                  "[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5"
+                  ":diff_mode=rectangle" % self.fps)
+            return base + ["-vf", vf, "-loop", "0", self.final]
+        if session_is_wayland():
+            return base + ["-vf", pre + "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264",
+                           "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+                           "-movflags", "+faststart", self.final]
+        return base + ["-c", "copy", "-movflags", "+faststart", self.final]
+
+    def _watch_post(self):
+        if self.post.poll() is None:
+            return True
+        if self.post.returncode == 0 and os.path.exists(self.final):
+            self._done(self.final)
+        else:
+            kept = os.path.join(videos_dir(), os.path.basename(self.final) + os.path.splitext(self.raw)[1])
+            try:
+                shutil.move(self.raw, kept)
+            except OSError:
+                kept = None
+            error_dialog("Conversion failed:\n%s\n\nThe raw recording was kept: %s"
+                         % (self._log_tail(), kept))
+            self._done(None)
+        return False
+
+    def _done(self, path, note=""):
+        if self.control:
+            self.control.destroy()
+            self.control = None
+        self._cleanup_tmp()
+        if path:
+            DoneWindow(self.app, path, note)
+        self.app.recorder = None
+        self.app.release()
+
+    def _cleanup_tmp(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+
+class DoneWindow(Gtk.Window):
+    def __init__(self, app, path, note=""):
+        super().__init__(title=APP_NAME)
+        app.hold()
+        self.connect("destroy", lambda *_: app.release())
+        self.path = path
+        self.set_icon_name("pixtack")
+        self.set_resizable(False)
+        self.set_keep_above(True)
+        size = os.path.getsize(path) / (1024 * 1024)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(14)
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup("<b>Recording saved</b>\n%s  (%.1f MB)%s" % (
+            GLib.markup_escape_text(path), size,
+            ("\n" + GLib.markup_escape_text(note)) if note else ""))
+        lbl.set_selectable(True)
+        box.pack_start(lbl, False, False, 0)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for label, cb in (("Open", self.open_file), ("Show in folder", self.show_folder),
+                          ("Copy path", self.copy_path), ("Close", lambda: self.destroy())):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", lambda _b, f=cb: f())
+            row.pack_start(b, True, True, 0)
+        box.pack_start(row, False, False, 0)
+        self.add(box)
+        self.show_all()
+        self.present()
+
+    def open_file(self):
+        Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(self.path).get_uri(), None)
+
+    def show_folder(self):
+        uri = Gio.File.new_for_path(self.path).get_uri()
+        try:
+            Gio.bus_get_sync(Gio.BusType.SESSION, None).call_sync(
+                "org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1", "ShowItems", GLib.Variant("(ass)", ([uri], "")),
+                None, Gio.DBusCallFlags.NONE, 3000, None)
+        except GLib.Error:
+            Gio.AppInfo.launch_default_for_uri(
+                Gio.File.new_for_path(os.path.dirname(self.path)).get_uri(), None)
+
+    def copy_path(self):
+        if not clipboard_set_bytes(self.path.encode(), "text/plain;charset=utf-8"):
+            cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            cb.set_text(self.path, -1)
+            cb.store()
+
+
+# --------------------------------------------------------------------------- launcher and app
+
+class Launcher(Gtk.Window):
+    ACTIONS = [("Region", "region", "Drag to select part of the screen"),
+               ("Full screen", "full", "Capture all monitors"),
+               ("Active window", "window", "Capture the focused window (Wayland: pick from the system dialog)"),
+               ("Open image…", "open", "Annotate an existing image"),
+               ("Record GIF", "gif", "Record an area to an animated GIF"),
+               ("Record video", "video", "Record an area to MP4")]
+
+    def __init__(self, app):
+        super().__init__(title=APP_NAME)
+        self.app = app
+        app.hold()
+        self.set_icon_name("pixtack")
+        self.set_resizable(False)
+        hb = Gtk.HeaderBar(show_close_button=True)
+        hb.props.title = APP_NAME
+        hb.props.subtitle = "v" + VERSION
+        self.set_titlebar(hb)
+        grid = Gtk.Grid(column_spacing=8, row_spacing=8, column_homogeneous=True)
+        grid.set_border_width(12)
+        for i, (label, action, tip) in enumerate(self.ACTIONS):
+            b = Gtk.Button(label=label)
+            b.set_tooltip_text(tip)
+            b.set_size_request(160, 44)
+            b.connect("clicked", self.on_action, action)
+            grid.attach(b, i % 2, i // 2, 1, 1)
+        row = len(self.ACTIONS) // 2
+        grid.attach(Gtk.Label(label="Delay (seconds)", xalign=0), 0, row, 1, 1)
+        self.delay = Gtk.SpinButton.new_with_range(0, 30, 1)
+        grid.attach(self.delay, 1, row, 1, 1)
+        keys = Gtk.Button(label="Keyboard shortcuts…")
+        keys.connect("clicked", lambda *_: ShortcutsDialog(self))
+        grid.attach(keys, 0, row + 1, 2, 1)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        prompt = self._shortcut_prompt()
+        if prompt:
+            box.pack_start(prompt, False, False, 0)
+        box.pack_start(grid, False, False, 0)
+        self.add(box)
+        self.connect("destroy", lambda *_: app.release())
+        self.connect("key-press-event", lambda _w, ev: Gdk.keyval_name(ev.keyval) == "Escape"
+                     and (self.destroy() or True))
+
+    def _shortcut_prompt(self):
+        """Offer to turn on global shortcuts, which are off after a fresh install."""
+        try:
+            if (not gnome_shortcuts_supported() or any(gnome_shortcut_bindings().values())
+                    or load_config().get("shortcut_prompt_dismissed")):
+                return None
+        except GLib.Error:
+            return None
+        bar = Gtk.InfoBar(message_type=Gtk.MessageType.INFO)
+        lbl = Gtk.Label(xalign=0, wrap=True, max_width_chars=38, label=(
+            "Global shortcuts are off. Turn them on to capture from anywhere with "
+            "Super+Shift+S (region), F (full screen), G (GIF) and R (video)."))
+        bar.get_content_area().add(lbl)
+        bar.add_button("_Enable", 1)
+        bar.add_button("Not now", 2)
+        bar.connect("response", self._on_prompt)
+        return bar
+
+    def _on_prompt(self, bar, response):
+        if response == 1:
+            skipped = apply_gnome_shortcuts() or []
+            if skipped:
+                error_dialog("Some shortcuts were not set because their keys are already in use:\n"
+                             + "\n".join("%s: used by '%s'" % s for s in skipped)
+                             + "\n\nChoose other keys in Keyboard shortcuts.", self)
+            else:
+                notify("Global shortcuts enabled", "Try Super+Shift+S for a region screenshot.")
+        else:
+            cfg = load_config()
+            cfg["shortcut_prompt_dismissed"] = True
+            save_config(cfg)
+        bar.destroy()
+
+    def on_action(self, _b, action):
+        if action == "open":
+            dlg = Gtk.FileChooserNative.new("Open image", self, Gtk.FileChooserAction.OPEN,
+                                            "_Open", "_Cancel")
+            f = Gtk.FileFilter()
+            f.set_name("Images")
+            f.add_pixbuf_formats()
+            dlg.add_filter(f)
+            if dlg.run() == Gtk.ResponseType.ACCEPT:
+                self.app.open_file(dlg.get_filename())
+                self.destroy()
+            dlg.destroy()
+            return
+        delay = self.delay.get_value()
+        self.hide()
+        self.app.dispatch(action, delay)
+        self.destroy()
+
+
+class App:
+    def __init__(self):
+        self.holds = 0
+        self.recorder = None
+
+    def hold(self):
+        self.holds += 1
+
+    def release(self):
+        self.holds -= 1
+        if self.holds <= 0:
+            GLib.idle_add(Gtk.main_quit)
+
+    def fail(self, msg):
+        if msg:
+            error_dialog(msg)
+        self.release()
+
+    def dispatch(self, action, delay=0.0):
+        if action in ("region", "full", "window"):
+            self.capture(action, delay)
+        elif action in ("gif", "video"):
+            self.record(action == "gif", delay)
+
+    def open_file(self, path):
+        try:
+            Editor(self, GdkPixbuf.Pixbuf.new_from_file(path), None)
+        except GLib.Error as e:
+            error_dialog("Could not open %s:\n%s" % (path, e.message))
+
+    # ---- screenshots
+    def capture(self, mode, delay=0.0):
+        self.hold()
+        GLib.timeout_add(int(delay * 1000) + 350, self._capture_now, mode)
+
+    def _capture_now(self, mode):
+        pb, err = capture_window() if mode == "window" else capture_desktop()
+        if pb is None:
+            self.fail(err)
+        elif mode == "region":
+            RegionSelector(pb, "Drag to select  ·  Enter: whole monitor  ·  Esc: cancel",
+                           lambda r: self._region_done(pb, r))
+        else:
+            Editor(self, pb, mode)
+            self.release()
+        return False
+
+    def _region_done(self, pb, res):
+        if res:
+            x, y, w, h = res["rect"]
+            if w >= 1 and h >= 1:
+                Editor(self, pb.new_subpixbuf(x, y, w, h).copy(), "region")
+        self.release()
+
+    # ---- recording
+    def record(self, gif, delay=0.0):
+        if self.recorder:
+            self.recorder.stop()
+            return
+        pid = running_recorder_pid()
+        if pid:
+            os.kill(pid, signal.SIGUSR1)
+            return
+        self.hold()
+        GLib.timeout_add(int(delay * 1000) + 350, self._record_select, gif)
+
+    def _record_select(self, gif):
+        pb, err = capture_desktop()
+        if pb is None:
+            self.fail(err)
+            return False
+        what = "GIF" if gif else "video"
+        RegionSelector(pb, "Drag to select the %s area  ·  Enter: whole monitor  ·  Esc: cancel" % what,
+                       lambda r: self._record_start(gif, r))
+        return False
+
+    def _record_start(self, gif, res):
+        if not res:
+            self.release()
+            return
+        self.recorder = Recorder(self, gif)
+        self.recorder.begin(res)
+
+    def on_stop_signal(self):
+        if self.recorder:
+            self.recorder.stop()
+        return GLib.SOURCE_CONTINUE
+
+    def on_terminate(self):
+        if self.recorder:
+            self.recorder.stop()
+        else:
+            Gtk.main_quit()
+        return GLib.SOURCE_CONTINUE
+
+    def linger_for_clipboard(self):
+        """GTK owns the clipboard only while we run, so stay alive until something else copies."""
+        self.hold()
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        state = {"done": False}
+
+        def done(*_):
+            if not state["done"]:
+                state["done"] = True
+                self.release()
+            return False
+
+        GLib.timeout_add(1000, lambda: (cb.connect("owner-change", done), False)[1])
+        GLib.timeout_add_seconds(1800, done)
+
+
+def running_recorder_pid():
+    try:
+        with open(PIDFILE) as fh:
+            pid = int(fh.read().strip())
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            if b"pixtack" not in fh.read():
+                return None
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------- GNOME shortcuts
+
+SHORTCUTS = [("region", "Region screenshot", "--region", "<Shift><Super>s"),
+             ("full", "Full-screen screenshot", "--full", "<Shift><Super>f"),
+             ("gif", "Record GIF (start/stop)", "--gif", "<Shift><Super>g"),
+             ("video", "Record video (start/stop)", "--video", "<Shift><Super>r")]
+MEDIA_KEYS = "org.gnome.settings-daemon.plugins.media-keys"
+KEY_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/pixtack-%s/"
+GNOME_KEY_SCHEMAS = ["org.gnome.desktop.wm.keybindings", "org.gnome.shell.keybindings",
+                     "org.gnome.mutter.keybindings", "org.gnome.mutter.wayland.keybindings",
+                     MEDIA_KEYS]
+ACCEL_MASK = int(Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+                 | Gdk.ModifierType.MOD1_MASK | Gdk.ModifierType.SUPER_MASK)
+
+
+def gnome_shortcuts_supported():
+    source = Gio.SettingsSchemaSource.get_default()
+    return source is not None and source.lookup(MEDIA_KEYS, True) is not None
+
+
+def _custom(key):
+    return Gio.Settings.new_with_path(MEDIA_KEYS + ".custom-keybinding", KEY_PATH % key)
+
+
+def gnome_shortcut_bindings():
+    """Current binding for each Pixtack shortcut, or None where it is not installed."""
+    if not gnome_shortcuts_supported():
+        return {}
+    current = Gio.Settings.new(MEDIA_KEYS).get_strv("custom-keybindings")
+    return {key: (_custom(key).get_string("binding") or None) if KEY_PATH % key in current else None
+            for key, _n, _a, _d in SHORTCUTS}
+
+
+def chosen_binding(key):
+    default = {k: d for k, _n, _a, d in SHORTCUTS}[key]
+    return load_config().get("global_keys", {}).get(key, default)
+
+
+def remember_binding(key, binding):
+    cfg = load_config()
+    cfg.setdefault("global_keys", {})[key] = binding
+    save_config(cfg)
+
+
+def _norm(accel):
+    key, mods = Gtk.accelerator_parse(accel or "")
+    if not key:
+        return None
+    return (Gdk.keyval_to_lower(key), int(mods) & ACCEL_MASK)
+
+
+def find_conflict(accel, ignore=()):
+    """Name of the GNOME or custom shortcut already using accel, if any."""
+    target = _norm(accel)
+    source = Gio.SettingsSchemaSource.get_default()
+    if not target or source is None:
+        return None
+    for schema in GNOME_KEY_SCHEMAS:
+        sc = source.lookup(schema, True)
+        if sc is None:
+            continue
+        settings = Gio.Settings.new(schema)
+        for name in sc.list_keys():
+            value = settings.get_value(name)
+            kind = value.get_type_string()
+            vals = value.unpack() if kind == "as" else [value.unpack()] if kind == "s" else []
+            if any(isinstance(v, str) and _norm(v) == target for v in vals):
+                return sc.get_key(name).get_summary() or name.replace("-", " ")
+    media = Gio.Settings.new(MEDIA_KEYS) if source.lookup(MEDIA_KEYS, True) else None
+    for path in (media.get_strv("custom-keybindings") if media else []):
+        if any(path == KEY_PATH % k for k in ignore):
+            continue
+        cs = Gio.Settings.new_with_path(MEDIA_KEYS + ".custom-keybinding", path)
+        if _norm(cs.get_string("binding")) == target:
+            return cs.get_string("name") or "a custom shortcut"
+    return None
+
+
+def set_gnome_shortcut(key, binding):
+    """Install (binding set) or remove (binding None) one Pixtack global shortcut."""
+    name, arg = {k: (n, a) for k, n, a, _d in SHORTCUTS}[key]
+    settings = Gio.Settings.new(MEDIA_KEYS)
+    current = list(settings.get_strv("custom-keybindings"))
+    path, cs = KEY_PATH % key, _custom(key)
+    if binding:
+        exe = shutil.which("pixtack") or os.path.abspath(sys.argv[0])
+        cs.set_string("name", "Pixtack: " + name)
+        cs.set_string("command", "%s %s" % (exe, arg))
+        cs.set_string("binding", binding)
+        if path not in current:
+            current.append(path)
+    else:
+        if path in current:
+            current.remove(path)
+        for k in ("name", "command", "binding"):
+            cs.reset(k)
+    settings.set_strv("custom-keybindings", current)
+    Gio.Settings.sync()
+
+
+def apply_gnome_shortcuts(remove=False):
+    """Enable or disable all. Returns skipped [(name, conflict)], or None if unsupported."""
+    if not gnome_shortcuts_supported():
+        return None
+    skipped = []
+    own = [k for k, _n, _a, _d in SHORTCUTS]
+    for key, name, _arg, _default in SHORTCUTS:
+        if remove:
+            set_gnome_shortcut(key, None)
+            continue
+        binding = chosen_binding(key)
+        clash = find_conflict(binding, ignore=own)
+        if clash:
+            skipped.append((name, clash))
+        else:
+            set_gnome_shortcut(key, binding)
+    return skipped
+
+
+def setup_shortcuts(remove=False):
+    skipped = apply_gnome_shortcuts(remove)
+    if skipped is None:
+        print("GNOME settings schema not found; set shortcuts in your desktop's keyboard settings.")
+        return 1
+    if remove:
+        print("Shortcuts removed.")
+        return 0
+    bindings = gnome_shortcut_bindings()
+    for key, name, _arg, _default in SHORTCUTS:
+        b = bindings.get(key)
+        print("%-28s %s" % (name, b.replace("<", "").replace(">", "+") if b else "(not set)"))
+    for name, clash in skipped:
+        print("Skipped %s: key already used by '%s'." % (name, clash))
+    print("Change keys from Pixtack's Keyboard shortcuts window (F1 in the editor).")
+    return 0
+
+
+def diagnose():
+    """Print what Pixtack can see, for troubleshooting and bug reports."""
+    env = os.environ.get
+    print("Pixtack %s  (Python %s, GTK %d.%d.%d)" % (VERSION, sys.version.split()[0], Gtk.get_major_version(),
+                                                 Gtk.get_minor_version(), Gtk.get_micro_version()))
+    print("Executable:      %s" % (shutil.which("pixtack") or os.path.abspath(sys.argv[0])))
+    print("Session:         %s  (WAYLAND_DISPLAY=%s, DISPLAY=%s)" % (
+        env("XDG_SESSION_TYPE", "?"), env("WAYLAND_DISPLAY", "-"), env("DISPLAY", "-")))
+    print("Desktop:         %s" % env("XDG_CURRENT_DESKTOP", "?"))
+    for tool in ("ffmpeg", "ffprobe", "wl-copy", "xclip", "notify-send", "grim"):
+        print("%-16s %s" % (tool + ":", "yes" if have(tool) else "no"))
+    try:
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        Gst.init(None)
+        pw = "yes" if Gst.ElementFactory.find("pipewiresrc") else "no (install gstreamer1.0-pipewire)"
+    except (ValueError, ImportError):
+        pw = "no (install gir1.2-gstreamer-1.0)"
+    print("GStreamer PipeWire: %s" % pw)
+    try:
+        version = Portal().get_property("org.freedesktop.portal.Screenshot", "version")
+        print("Screenshot portal: %s" % ("version %s" % version if version else "not found"))
+    except GLib.Error as e:
+        print("Screenshot portal: error (%s)" % e.message)
+    print()
+    if not gnome_shortcuts_supported():
+        print("Global shortcuts: GNOME settings not found on this desktop.")
+    else:
+        bindings = gnome_shortcut_bindings()
+        own = [k for k, _n, _a, _d in SHORTCUTS]
+        print("Global shortcuts:%s" % ("" if any(bindings.values()) else
+                                       "  NOT ENABLED (open Keyboard shortcuts > Enable all)"))
+        for key, name, arg, _default in SHORTCUTS:
+            b = bindings.get(key)
+            if not b:
+                print("  %-27s off" % name)
+                continue
+            cmd = _custom(key).get_string("command")
+            exe = cmd.split()[0] if cmd else ""
+            problems = []
+            if not exe or not os.access(exe, os.X_OK):
+                problems.append("command not found: %r" % cmd)
+            clash = find_conflict(b, ignore=own)
+            if clash:
+                problems.append("key also used by '%s'" % clash)
+            print("  %-27s %-18s %s" % (name, b, "; ".join(problems) or "OK"))
+    print()
+    print("Log file: %s" % LOGFILE)
+    try:
+        with open(LOGFILE) as fh:
+            tail = fh.readlines()[-8:]
+        print("Last log lines:\n" + "".join("  " + line for line in tail).rstrip())
+    except OSError:
+        print("  (no log yet)")
+    return 0
+
+
+# --------------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="pixtack", description="Lightweight screenshot and recording tool.")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--region", action="store_true", help="capture a region")
+    g.add_argument("--full", action="store_true", help="capture all monitors")
+    g.add_argument("--window", action="store_true", help="capture the active window")
+    g.add_argument("--gif", action="store_true", help="start or stop a GIF recording")
+    g.add_argument("--video", action="store_true", help="start or stop a video recording")
+    g.add_argument("--stop", action="store_true", help="stop the current recording")
+    g.add_argument("--open", metavar="FILE", help="annotate an existing image")
+    g.add_argument("--setup-shortcuts", action="store_true", help="add GNOME keyboard shortcuts")
+    g.add_argument("--remove-shortcuts", action="store_true", help="remove Pixtack's GNOME shortcuts")
+    g.add_argument("--diagnose", action="store_true", help="print setup details for bug reports")
+    ap.add_argument("--delay", type=float, default=0.0, help="seconds to wait before capturing")
+    ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    args = ap.parse_args()
+
+    GLib.set_prgname("pixtack")
+    GLib.set_application_name(APP_NAME)
+
+    if args.stop or args.gif or args.video:
+        pid = running_recorder_pid()
+        if pid:
+            os.kill(pid, signal.SIGUSR1)
+            return 0
+        if args.stop:
+            print("No recording in progress.")
+            return 1
+    if args.diagnose:
+        return diagnose()
+    if args.setup_shortcuts or args.remove_shortcuts:
+        return setup_shortcuts(remove=args.remove_shortcuts)
+    setup_logging()
+
+    app = App()
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, app.on_stop_signal)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, app.on_terminate)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, app.on_terminate)
+
+    if args.open:
+        app.hold()
+        app.open_file(args.open)
+        GLib.idle_add(app.release)
+    elif args.region or args.full or args.window:
+        app.capture("region" if args.region else "full" if args.full else "window", args.delay)
+    elif args.gif or args.video:
+        app.record(args.gif, args.delay)
+    else:
+        Launcher(app).show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,36 @@
+[Desktop Entry]
+Type=Application
+Name=Pixtack
+GenericName=Screenshot Tool
+Comment=Lightweight screenshots, annotation, GIF and screen recording
+Exec=pixtack
+Icon=pixtack
+Terminal=false
+Categories=Utility;Graphics;
+Keywords=screenshot;capture;screen;record;gif;annotate;snip;
+StartupNotify=false
+Actions=region;full;window;gif;video;stop;
+
+[Desktop Action region]
+Name=Capture region
+Exec=pixtack --region
+
+[Desktop Action full]
+Name=Capture full screen
+Exec=pixtack --full
+
+[Desktop Action window]
+Name=Capture active window
+Exec=pixtack --window
+
+[Desktop Action gif]
+Name=Record GIF
+Exec=pixtack --gif
+
+[Desktop Action video]
+Name=Record video
+Exec=pixtack --video
+
+[Desktop Action stop]
+Name=Stop recording
+Exec=pixtack --stop
